@@ -13,6 +13,7 @@ const zoomedRange = (axis: Partial<LayoutAxis>, zoom: number) => {
   return [center - radius, center + radius];
 };
 const ONE_FINGER_DOUBLE_TAP_ZOOM_MS_THRESHOLD = 250;
+const HOVER_LABEL_HIT_PADDING_PX = 6;
 export class TouchController {
   isEnabled = true;
   lastTouches?: TouchList;
@@ -56,22 +57,50 @@ export class TouchController {
     e.stopImmediatePropagation();
   }
 
-  isMainPlotTouch(e: TouchEvent) {
-    const target = e.target;
+  getEventTouch(e: TouchEvent) {
+    return e.touches[0] || e.changedTouches[0];
+  }
+
+  getMainDragger() {
+    return this.el.querySelector<SVGRectElement>(".nsewdrag.drag");
+  }
+
+  touchIsInsideRect(touch: Touch, rect: DOMRect, padding = 0) {
     return (
-      target instanceof Element &&
-      target.classList.contains("nsewdrag") &&
-      target.classList.contains("drag")
+      touch.clientX >= rect.left - padding &&
+      touch.clientX <= rect.right + padding &&
+      touch.clientY >= rect.top - padding &&
+      touch.clientY <= rect.bottom + padding
     );
   }
 
+  isMainPlotTouch(e: TouchEvent) {
+    const touch = this.getEventTouch(e);
+    const dragger = this.getMainDragger();
+    if (!touch || !dragger) return false;
+    return this.touchIsInsideRect(touch, dragger.getBoundingClientRect());
+  }
+
   isHoverLabelTouch(e: TouchEvent) {
-    const target = e.target;
-    return target instanceof Element && !!target.closest(".hoverlayer");
+    const touch = this.getEventTouch(e);
+    if (!touch) return false;
+
+    const labels = this.el.querySelectorAll<SVGGraphicsElement>(
+      ".hoverlayer .hovertext, .hoverlayer .axistext, .hoverlayer .legend",
+    );
+
+    return Array.from(labels).some((label) => {
+      const rect = label.getBoundingClientRect();
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        this.touchIsInsideRect(touch, rect, HOVER_LABEL_HIT_PADDING_PX)
+      );
+    });
   }
 
   scrubHover(touch: Touch) {
-    const dragger = this.el.querySelector<SVGRectElement>(".nsewdrag.drag");
+    const dragger = this.getMainDragger();
     if (!dragger) return;
 
     dragger.dispatchEvent(
@@ -135,6 +164,8 @@ export class TouchController {
       return;
     }
 
+    // Tapping outside the plot body clears the tooltip, but the event is left
+    // alone so Plotly's separate axis drag regions can still pan normally.
     this.clearHover();
     this.lastSingleTouchTimestamp = 0;
     this.state = "idle";
@@ -185,7 +216,7 @@ export class TouchController {
       deltaY: -dist,
     });
 
-    this.el.querySelector(".nsewdrag.drag")!.dispatchEvent(wheelEvent);
+    this.getMainDragger()!.dispatchEvent(wheelEvent);
   }
 
   onTouchEnd = (e: TouchEvent) => {
