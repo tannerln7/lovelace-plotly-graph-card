@@ -86,7 +86,8 @@ export class TouchController {
   }
 
   clearHover() {
-    Plotly.Fx.unhover(this.el);
+    // Plotly exposes Fx at runtime, but @types/plotly.js does not declare it.
+    (Plotly as any).Fx.unhover(this.el);
   }
 
   onTouchStart = async (e: TouchEvent) => {
@@ -95,6 +96,7 @@ export class TouchController {
     if (e.touches.length === 1 && this.isHoverLabelTouch(e)) {
       this.captureTouch(e);
       this.clearHover();
+      this.lastSingleTouchTimestamp = 0;
       this.state = "idle";
       return;
     }
@@ -103,6 +105,7 @@ export class TouchController {
       this.captureTouch(e);
       const wasZooming = this.state === "two fingers";
       this.state = "two fingers";
+      this.lastSingleTouchTimestamp = 0;
       this.lastTouches = e.touches;
       this.clientX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       this.clientY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
@@ -118,6 +121,7 @@ export class TouchController {
         ONE_FINGER_DOUBLE_TAP_ZOOM_MS_THRESHOLD
       ) {
         this.state = "one finger";
+        this.lastSingleTouchTimestamp = 0;
         this.clientX = e.touches[0].clientX;
         this.clientY = e.touches[0].clientY;
         this.lastTouches = e.touches;
@@ -132,6 +136,7 @@ export class TouchController {
     }
 
     this.clearHover();
+    this.lastSingleTouchTimestamp = 0;
     this.state = "idle";
   };
 
@@ -206,6 +211,7 @@ export class TouchController {
       this.onZoomEnd();
     }
     this.captureTouch(e);
+    this.lastSingleTouchTimestamp = 0;
     this.state = "idle";
   };
 }
