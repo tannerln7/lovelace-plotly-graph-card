@@ -2,7 +2,7 @@ import { Layout, LayoutAxis } from "plotly.js";
 import Plotly from "./plotly";
 
 type PlotlyEl = Plotly.PlotlyHTMLElement & {
-  data: (Plotly.PlotData & { entity: string })[];
+  data: (Plotly.Data & { entity: string })[];
   layout: Plotly.Layout;
 };
 const zoomedRange = (axis: Partial<LayoutAxis>, zoom: number) => {
