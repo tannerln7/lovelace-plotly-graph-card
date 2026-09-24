@@ -43,6 +43,7 @@ export class PlotlyGraph extends HTMLElement {
   isBrowsing = false;
   isInternalRelayout = 0;
   touchController: TouchController;
+  pendingTouchMode?: object;
   configParser = new ConfigParser();
   pausedRendering = false;
   handles: {
@@ -134,7 +135,7 @@ export class PlotlyGraph extends HTMLElement {
       },
       onZoomEnd: () => {
         this.pausedRendering = false;
-        this.plot({ should_fetch: true });
+        if (this.isConnected) this.plot({ should_fetch: true });
       },
     });
     this.withoutRelayout(() => Plotly.newPlot(this.contentEl, [], {}));
@@ -354,6 +355,7 @@ export class PlotlyGraph extends HTMLElement {
     this.config = config;
     const is = this.config;
     this.touchController.isEnabled = !is.disable_pinch_to_zoom;
+    this.pendingTouchMode = {};
     this.exitBrowsingMode();
   }
   getCSSVars() {
@@ -391,6 +393,7 @@ export class PlotlyGraph extends HTMLElement {
     const uirevision = this.isBrowsing
       ? this.contentEl.layout?.uirevision || 0
       : Math.random();
+    const touchModeToken = this.pendingTouchMode;
     const yaml = merge(
       {},
       this.config,
@@ -415,6 +418,15 @@ export class PlotlyGraph extends HTMLElement {
       .map((e) => "<span>" + (e || "See devtools console") + "</span>")
       .join("\n<br />\n");
     this.parsed_config = parsed;
+    if (touchModeToken === this.pendingTouchMode) {
+      this.touchController.touchHoverEnabled = parsed.touch_hover;
+      if (touchModeToken) {
+        this.touchController.setTouchDragMode(
+          parsed.touch_hover ? "hover" : "plotly"
+        );
+        this.pendingTouchMode = undefined;
+      }
+    }
 
     const {
       entities,
@@ -434,8 +446,12 @@ export class PlotlyGraph extends HTMLElement {
     if (layout.paper_bgcolor) {
       this.titleEl.style.background = layout.paper_bgcolor as string;
     }
+    const plotlyConfig = this.touchController.touchHoverEnabled
+      ? this.touchController.withTouchHoverModeBar(config)
+      : config;
     await this.withoutRelayout(async () => {
-      await Plotly.react(this.contentEl, entities, layout, config);
+      await Plotly.react(this.contentEl, entities, layout, plotlyConfig);
+      this.touchController.syncModeBarState();
       if (autorange_after_scroll) {
         const update = {
           "yaxis.autorange": true,

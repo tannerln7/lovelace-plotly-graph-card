@@ -228,6 +228,7 @@ export function addPreParsingDefaults(
     );
     return entity;
   });
+  if (yaml.touch_hover === undefined) yaml.touch_hover = false;
   return yaml;
 }
 

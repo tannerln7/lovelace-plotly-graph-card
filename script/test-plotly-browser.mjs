@@ -436,6 +436,7 @@ try {
           entity: "",
           x: [Date.now() - 3600000, Date.now()],
           y: [10, 20],
+          mode: "lines+markers",
           name: "Test power",
           unit_of_measurement: "W",
         },
@@ -470,6 +471,299 @@ try {
     const card = document.getElementById("card-under-test");
     return card.contentEl._fullLayout.width <= 320;
   });
+  // Native touch and detached-target completion need browser hit testing, not dispatchEvent.
+  const cdp = await page.context().newCDPSession(page);
+  const input = (type, touchPoints = []) =>
+    cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+  const configure = async (overrides = {}) => page.evaluate(async (overrides) => {
+    const card = document.getElementById("card-under-test");
+    window.touchBaseConfig ||= card.config;
+    await card.setConfig({ ...touchBaseConfig, ...overrides });
+    await card.plot({});
+    window.touchClicks = 0;
+    if (window.countTouchClick) card.contentEl.removeListener("plotly_click", window.countTouchClick);
+    window.countTouchClick = () => window.touchClicks++;
+    card.contentEl.on("plotly_click", window.countTouchClick);
+    const r = card.contentEl.querySelector(".scatterlayer .point").getBoundingClientRect();
+    return { id: 1, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, overrides);
+  for (const mode of ["pan", "zoom"]) {
+    const p = await configure({ layout: { dragmode: mode } });
+    await input("touchStart", [p]);
+    await input("touchEnd");
+    assert.deepEqual(await page.evaluate(() => {
+      const gd = document.getElementById("card-under-test").contentEl;
+      return [touchClicks, gd._hoverdata?.[0].pointNumber,
+        !!gd.querySelector(".hovertext"), !!gd.querySelector('[data-attr="touchHover"]')];
+    }), [1, 0, true, false]);
+    // Separate native gestures without resetting the card's double-tap history.
+    await page.waitForTimeout(300);
+    const before = await page.evaluate(() => [...document.getElementById("card-under-test").contentEl._fullLayout.xaxis.range]);
+    await input("touchStart", [{ ...p, x: p.x - 80, y: p.y - 25 }]);
+    await input("touchMove", [{ ...p, x: p.x - 30, y: p.y + 15 }]);
+    await input("touchEnd");
+    await page.waitForTimeout(50);
+    assert.notDeepEqual(await page.evaluate(() => document.getElementById("card-under-test").contentEl._fullLayout.xaxis.range), before);
+    assert.equal(await page.evaluate(() => touchClicks), 1, "Native drag clicked");
+    // Hover overrides touch, not real mouse dragging in either native mode.
+    const mouse = await configure({ touch_hover: true, layout: { dragmode: mode } });
+    const mouseRange = await page.evaluate(() => [...document.getElementById("card-under-test").contentEl._fullLayout.xaxis.range]);
+    await page.mouse.move(mouse.x - 80, mouse.y - 25); await page.mouse.down();
+    await page.mouse.move(mouse.x - 30, mouse.y + 15, { steps: 3 }); await page.mouse.up();
+    assert.notDeepEqual(await page.evaluate(() => document.getElementById("card-under-test").contentEl._fullLayout.xaxis.range), mouseRange);
+  }
+
+  await configure({ touch_hover: true, layout: { dragmode: "zoom" } });
+  await page.evaluate(async () => {
+    const card = document.getElementById("card-under-test"), gd = card.contentEl;
+    const c = card.touchController, Plotly = PlotlyTest.default;
+    const check = (ok, message) => { if (!ok) throw new Error(message); };
+    const tick = () => new Promise(resolve => requestAnimationFrame(resolve));
+    const center = el => { const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; };
+    const main = () => gd.querySelector(".nsewdrag.drag");
+    const point = () => center(gd.querySelector(".scatterlayer .point"));
+    const touch = (target, p = point(), identifier = 1) =>
+      new Touch({ identifier, target, clientX: p.x, clientY: p.y });
+    const fire = (target, type, touches, changedTouches = touches) => {
+      const e = new TouchEvent(type, { bubbles: true, composed: true, cancelable: true, touches,
+        targetTouches: touches.filter(t => t.target === target), changedTouches });
+      target.dispatchEvent(e);
+      return e;
+    };
+    const tap = (target, p = point(), jitter = 0) => {
+      const a = touch(target, p), b = touch(target, { x: p.x + jitter, y: p.y });
+      fire(target, "touchstart", [a]);
+      if (jitter) fire(target, "touchmove", [b]);
+      fire(target, "touchend", [], [b]);
+    };
+    const button = () => gd.querySelector('[data-attr="touchHover"]');
+    const native = mode => gd.querySelector('[data-attr="dragmode"][data-val="' + mode + '"]');
+    const clear = () => Plotly.Fx.unhover(gd);
+    check(c.touchDragMode === "hover" && gd._fullLayout.dragmode === "zoom", "Touch/mouse modes are not independent");
+
+    // Config structure: preserve Plotly's explicit/default and flat/grouped distinctions.
+    const added = { name: "existing", icon: Plotly.Icons.home, click() {} };
+    for (const config of [{}, { modeBarButtons: [] }, { modeBarButtonsToAdd: [added] },
+      { modeBarButtonsToAdd: [[added]] }, { modeBarButtons: [["pan2d"]], modeBarButtonsToAdd: [added] }]) {
+      const before = JSON.stringify(config), wrapped = c.withTouchHoverModeBar(config);
+      check(JSON.stringify(config) === before, "Wrapper mutated user config");
+      if (config.modeBarButtons?.length) {
+        check(wrapped.modeBarButtons.length === 2 && wrapped.modeBarButtonsToAdd === config.modeBarButtonsToAdd, "Explicit groups changed");
+      } else {
+        const additions = wrapped.modeBarButtonsToAdd;
+        check(Array.isArray(additions.at(-1)) === Array.isArray(config.modeBarButtonsToAdd?.[0]), "Addition structure changed");
+      }
+    }
+    const selected = active => {
+      check(button().classList.contains("active") === active, "Wrong selected class");
+      const expected = active || button().matches(":hover") ? gd._fullLayout.modebar.activecolor : gd._fullLayout.modebar.color;
+      const style = document.createElement("span").style;
+      style.color = expected;
+      check(button().querySelector(".icon path").style.fill === style.color, "Wrong selected icon fill");
+    };
+    selected(true);
+    button().click(); await Promise.resolve(); selected(true);
+    gd.querySelector('[data-attr="zoom"][data-val="in"]').click();
+    await tick(); selected(true);
+    native("pan").click(); await tick(); selected(false);
+    button().click(); await Promise.resolve();
+    native("pan").click(); await Promise.resolve(); selected(false);
+    button().click(); await Promise.resolve();
+    native("zoom").click(); await tick(); selected(false);
+    await card.plot({});
+    check(c.touchDragMode === "plotly", "Replot reset runtime selection");
+    check(gd.querySelectorAll('[data-attr="touchHover"]').length === 1, "Replot accumulated buttons");
+    button().click(); await Promise.resolve();
+
+    // Keep low-level gesture assertions stable; lifecycle cases below restore live relayout.
+    card.handles.relayoutListener?.off("plotly_relayout", card.onRelayout);
+    try {
+      const xs = gd.data[0].x.map(x => +new Date(x));
+      await Plotly.relayout(gd, { "xaxis.range": [Math.min(...xs) - 3600000, Math.max(...xs) + 3600000], hovermode: "x" });
+      for (const jitter of [0, 3]) {
+        clear(); const before = touchClicks;
+        tap(main(), point(), jitter); await tick();
+        check(touchClicks === before + 1, "Stationary/jitter tap lost click");
+        check(!card.pausedRendering, "Hover tap invoked double-tap zoom");
+        // These are independent tap cases, not one Plotly double-click train.
+        await new Promise(resolve => setTimeout(resolve, gd._context.doubleClickDelay + 20));
+      }
+      clear();
+      const target = main(), p = point(), a = touch(target, { x: p.x - 20, y: p.y }), b = touch(target, p);
+      const before = touchClicks, range = JSON.stringify(gd._fullLayout.xaxis.range);
+      fire(target, "touchstart", [a]); fire(target, "touchmove", [b]); fire(target, "touchend", [], [b]);
+      await new Promise(resolve => setTimeout(resolve, 80));
+      check(touchClicks === before && JSON.stringify(gd._fullLayout.xaxis.range) === range, "Scrub clicked or changed range");
+      check(!gd._dragging && gd.querySelector(".hovertext"), "Scrub did not use hover exclusively");
+      // Rapid consecutive Hover gestures must not arm upstream one-finger zoom.
+      clear();
+      for (let i = 0; i < 2; i++) {
+        fire(target, "touchstart", [a]); fire(target, "touchmove", [b]); fire(target, "touchend", [], [b]);
+      }
+      check(!card.pausedRendering && JSON.stringify(gd._fullLayout.xaxis.range) === range && touchClicks === before,
+        "Rapid Hover gestures invoked zoom or click");
+      await new Promise(resolve => setTimeout(resolve, 80));
+      // Coordinates lie inside label geometry, while browser hit testing chooses the underlying surface.
+      const label = gd.querySelector(".hovertext"), lp = center(label);
+      check(card.shadowRoot.elementFromPoint(lp.x, lp.y) === target, "Tooltip fixture does not hit main dragger");
+      tap(target, lp);
+      check(!gd.querySelector(".hovertext") && touchClicks === before, "Dismissal clicked or did not clear");
+      clear(); tap(target); await tick();
+      const axisLabel = gd.querySelector(".axistext"), ap = center(axisLabel);
+      const axis = card.shadowRoot.elementFromPoint(ap.x, ap.y);
+      check(axis.matches(".ewdrag.drag"), "Tooltip overlap fixture does not hit axis");
+      const axisTouch = touch(axis, ap);
+      fire(axis, "touchstart", [axisTouch]);
+      check(c.state === "idle", "Axis overlap acquired Hover");
+      fire(axis, "touchend", [], [axisTouch]);
+      clear();
+      // Selecting a native tool during ownership only affects the next gesture.
+      fire(target, "touchstart", [a]); native("pan").click(); await Promise.resolve();
+      fire(target, "touchmove", [b]); fire(target, "touchend", [], [b]);
+      check(!gd._dragging && c.touchDragMode === "plotly", "Tool selection handed off an owned gesture");
+    } finally {
+      card.handles.relayoutListener.on("plotly_relayout", card.onRelayout);
+    }
+
+    // Live pinch lifecycle: callbacks, rendering pause, partial release and cancellation.
+    const start = c.onZoomStart, end = c.onZoomEnd;
+    let starts = 0, ends = 0;
+    c.onZoomStart = () => { starts++; start(); };
+    c.onZoomEnd = () => { ends++; end(); };
+    try {
+      for (const enabled of [true, false]) for (const completion of ["touchend", "touchcancel"]) {
+        c.isEnabled = enabled; c.setTouchDragMode("hover"); clear();
+        const target = main(), p = center(target);
+        const a = touch(target, p), b = touch(target, { x: p.x + 30, y: p.y }, 2);
+        const clicks = touchClicks, count = starts;
+        fire(target, "touchstart", [a]); fire(target, "touchstart", [a, b], [b]);
+        check(card.pausedRendering === enabled, "Wrong pinch pause");
+        const moved = touch(target, { x: p.x + 65, y: p.y }, 2);
+        const range = JSON.stringify(gd._fullLayout.xaxis.range);
+        fire(target, "touchmove", [a, moved], [moved]);
+        await tick();
+        check((JSON.stringify(gd._fullLayout.xaxis.range) !== range) === enabled, "Wrong pinch movement");
+        fire(target, "touchend", [a], [moved]);
+        check(card.pausedRendering === enabled && ends === count, "Partial release ended pinch pause");
+        await card.plot({});
+        if (enabled) check(main() === target, "Paused replot replaced pinch target");
+        fire(target, completion, [], [a]);
+        check(!card.pausedRendering && starts === ends && c.state === "idle", "Pinch completion did not balance");
+        check(!gd._dragging && touchClicks === clicks, "Multi-touch leaked or clicked");
+        await card.plot({});
+      }
+    } finally { c.onZoomStart = start; c.onZoomEnd = end; c.isEnabled = true; }
+
+    // Actual parser expressions and single-token initialization race.
+    for (const expression of ["$ex true", "$fn () => true"]) {
+      await card.setConfig({ ...touchBaseConfig, touch_hover: expression });
+      await card.plot({});
+      check(c.touchDragMode === "hover", "Expression did not enable Hover");
+    }
+    card.hass.states.enabled = { state: "on" };
+    await card.setConfig({ ...touchBaseConfig, touch_hover: '$ex hass.states.enabled.state === "on"' });
+    for (const value of ["on", "off", "on"]) {
+      card.hass.states.enabled = { state: value };
+      await card.plot({});
+      check(!!button() === (value === "on"), "Resolved availability disagrees with toolbar");
+      clear(); const target = main(), a = touch(target);
+      let delivered = false;
+      const observe = () => { delivered = true; };
+      target.addEventListener("touchstart", observe);
+      fire(target, "touchstart", [a]);
+      target.removeEventListener("touchstart", observe);
+      check(delivered === (value === "off"), "Resolved availability disagrees with acquisition");
+      fire(target, value === "on" ? "touchcancel" : "touchend", [], [a]);
+    }
+    native("pan").click(); await Promise.resolve();
+    await card.plot({});
+    check(c.touchDragMode === "plotly", "Expression reevaluation reset runtime selection");
+    const update = card.configParser.update.bind(card.configParser);
+    for (const initial of [false, true]) {
+      const availability = c.touchHoverEnabled, mode = c.touchDragMode;
+      let release, entered;
+      const gate = new Promise(resolve => release = resolve);
+      const waiting = new Promise(resolve => entered = resolve);
+      let first = true, checked = false;
+      card.configParser.update = async args => {
+        if (!first && !checked) {
+          check(c.touchHoverEnabled === availability && c.touchDragMode === mode, "Stale parse changed availability or selection");
+          checked = true;
+        }
+        const result = await update(args);
+        if (first) { first = false; entered(); await gate; }
+        return result;
+      };
+      try {
+        await card.setConfig({ ...touchBaseConfig, touch_hover: initial });
+        const old = card.plot({});
+        await waiting;
+        await card.setConfig({ ...touchBaseConfig, touch_hover: !initial });
+        release(); await old; await card.plot({});
+        check(checked && !card.pendingTouchMode && c.touchDragMode === (initial ? "plotly" : "hover")
+          && c.touchHoverEnabled === !initial && !!button() === !initial, "Old parse consumed new initialization");
+      } finally { card.configParser.update = update; }
+    }
+    // A plot without a Cartesian main dragger cannot acquire Hover.
+    const other = document.createElement("div"); document.body.append(other);
+    await Plotly.newPlot(other, [{ type: "scatterternary", a: [1], b: [1], c: [1] }]);
+    const otherController = new c.constructor({ el: other, onZoomStart() { throw new Error("Non-Cartesian zoom acquired"); }, onZoomEnd() {} });
+    otherController.touchHoverEnabled = true; otherController.setTouchDragMode("hover"); otherController.connect();
+    try {
+      check(!otherController.getMainDragger(), "Non-Cartesian fixture has Cartesian dragger");
+      const t = touch(other, { x: 10, y: 10 });
+      check(!fire(other, "touchstart", [t]).defaultPrevented, "Non-Cartesian event intercepted");
+      await Plotly.react(other, other.data, other.layout, otherController.withTouchHoverModeBar({ displayModeBar: true }));
+      otherController.syncModeBarState();
+      check(other.querySelector('[data-attr="touchHover"]').style.display === "none", "Non-Cartesian Hover tool exposed");
+    } finally { otherController.disconnect(); Plotly.purge(other); other.remove(); }
+  });
+
+  // A real held touch completes on its detached original target, without clicking new data.
+  for (const completion of ["touchEnd", "touchCancel"]) {
+    const p = await configure({ touch_hover: true });
+    await input("touchStart", [p]);
+    await page.evaluate(async () => {
+      const card = document.getElementById("card-under-test");
+      window.oldTouchTarget = card.contentEl.querySelector(".nsewdrag");
+      await card.plot({});
+      if (oldTouchTarget.isConnected) throw new Error("Expected dragger replacement");
+    });
+    // B's start is consumed on the replacement. A ending must not release B.
+    const b = { ...p, id: 2, x: p.x + 15 };
+    await input("touchStart", [p, b]);
+    await input("touchEnd", [b]);
+    const third = { ...p, id: 3, x: p.x - 15 };
+    await input("touchStart", [b, third]);
+    assert.deepEqual(await page.evaluate(() => {
+      const card = document.getElementById("card-under-test");
+      return [card.touchController.state, !!card.contentEl._dragging, card.pausedRendering];
+    }), ["hover consumed", false, false], "Replacement contact escaped into native pinch");
+    await input(completion);
+    assert.deepEqual(await page.evaluate(() => {
+      const c = document.getElementById("card-under-test").touchController;
+      return [c.state, !!c.hoverTarget, c.hoverContacts.size, touchClicks];
+    }), ["idle", false, 0, 0]);
+  }
+  // An axis contact stays native even while another finger belongs to Hover.
+  const held = await configure({ touch_hover: true });
+  await input("touchStart", [held]);
+  const axis = await page.evaluate(() => {
+    const card = document.getElementById("card-under-test"), target = card.contentEl.querySelector(".ewdrag.drag");
+    window.axisStarts = 0;
+    target.addEventListener("touchstart", () => axisStarts++, { once: true });
+    const r = target.getBoundingClientRect();
+    return { id: 2, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await input("touchStart", [held, axis]);
+  assert.deepEqual(await page.evaluate(() => {
+    const card = document.getElementById("card-under-test");
+    return [axisStarts, card.touchController.state, card.pausedRendering];
+  }), [1, "hover consumed", false], "Axis start was stolen or entered the controller's native pinch path");
+  await input("touchEnd", [held]); await input("touchEnd");
+  assert.equal(await page.evaluate(() => touchClicks), 0, "Axis multi-touch retained Hover tap eligibility");
+  results.results.push("native touch preservation and opt-in touch hover");
+
   results.results.push("Lovelace card with mock HA state");
   const modernCardResults = await page.evaluate(async () => {
     const card = document.getElementById("card-under-test");
@@ -500,6 +794,34 @@ try {
     return rendered;
   });
   results.results.push(...modernCardResults);
+  await configure({ touch_hover: true });
+  // Disconnecting an owned pinch must clear the render pause without scheduling a disconnected replot.
+  await page.evaluate(() => {
+    const card = document.getElementById("card-under-test");
+    const c = card.touchController;
+    c.isEnabled = true;
+    c.touchHoverEnabled = true;
+    c.setTouchDragMode("hover");
+    const target = card.contentEl.querySelector(".nsewdrag.drag");
+    const r = target.getBoundingClientRect();
+    const p = { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    const a = new Touch({ identifier: 1, target, clientX: p.x, clientY: p.y });
+    const b = new Touch({ identifier: 2, target, clientX: p.x + 30, clientY: p.y });
+    const fire = (type, touches, changedTouches = touches) =>
+      target.dispatchEvent(new TouchEvent(type, {
+        bubbles: true, cancelable: true, composed: true, touches,
+        targetTouches: touches, changedTouches,
+      }));
+    fire("touchstart", [a]);
+    fire("touchstart", [a, b], [b]);
+    if (!card.pausedRendering || c.state !== "hover pinch")
+      throw new Error("Disconnect fixture did not enter owned pinch");
+    card.remove();
+    if (card.pausedRendering || c.state !== "idle")
+      throw new Error("Disconnect left owned pinch paused");
+  });
+  await page.waitForTimeout(20);
+
   assert.deepEqual(errors, []);
   console.log(
     `Plotly ${results.version}: ${results.results.length} browser checks passed`,

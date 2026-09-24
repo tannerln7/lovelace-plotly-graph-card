@@ -1,5 +1,5 @@
-import { addPostParsingDefaults } from "./defaults";
-import { Config } from "../types";
+import { addPostParsingDefaults, addPreParsingDefaults } from "./defaults";
+import { Config, InputConfig } from "../types";
 
 function apply(overrides: Partial<Config> = {}) {
   return addPostParsingDefaults({
@@ -86,4 +86,45 @@ describe("Plotly 4 compatibility", () => {
     expect(result.layout.yaxis?.title).toEqual({ text: "Power" });
     expect(result.layout.xaxis?.range).toEqual([20, 30]);
   });
+});
+
+describe("touch hover defaults", () => {
+  beforeEach(() => {
+    (global as any).window = { PlotlyGraphCardPresets: {} };
+  });
+  const input = (overrides: Partial<InputConfig> = {}) =>
+    ({
+      type: "custom:plotly-graph",
+      entities: [],
+      ...overrides,
+    }) as InputConfig;
+
+  test.each([
+    [undefined, undefined, false],
+    [true, undefined, true],
+    [false, undefined, false],
+    [undefined, true, true],
+    [undefined, false, false],
+    [false, true, false],
+    [true, false, true],
+  ])("card %s / preset %s resolves to %s", (card, preset, expected) => {
+    (global as any).window.PlotlyGraphCardPresets = {
+      test: { touch_hover: preset },
+    };
+    const yaml = input({ preset: "test", touch_hover: card });
+    expect(addPreParsingDefaults(yaml, {} as any).touch_hover).toBe(expected);
+    expect(yaml.touch_hover).toBe(card);
+  });
+
+  test.each(["$ex true", "$fn ({ hass }) => !!hass", () => true])(
+    "keeps expressions for the normal parser: %s",
+    (expression) => {
+      (global as any).window.PlotlyGraphCardPresets = {
+        test: { touch_hover: expression },
+      };
+      expect(
+        addPreParsingDefaults(input({ preset: "test" }), {} as any).touch_hover,
+      ).toBe(expression);
+    },
+  );
 });
