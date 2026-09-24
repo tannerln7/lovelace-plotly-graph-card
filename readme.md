@@ -1013,6 +1013,22 @@ disable_pinch_to_zoom: true # defaults to false
 
 When true, the custom implementations of pinch-to-zoom and double-tap-drag-to-zooming will be disabled.
 
+## touch_hover
+
+```yaml
+touch_hover: true # defaults to false
+```
+
+When selected, Touch Hover makes one-finger dragging on the plot scrub the Plotly hover tooltip. It only overrides touch dragging; mouse and keyboard behavior and Plotly's native `layout.dragmode` are unchanged.
+
+Setting `touch_hover: true` adds a **Touch hover** modebar button. Touch Hover is initially selected unless the card configuration (including presets) explicitly supplies a valid `layout.dragmode`, in which case that native mode is initially selected instead. The card's default Pan mode does not count as an explicit setting. Press **Touch hover** to select scrubbing; selecting a native drag tool restores native handling for future touches. For example, with `layout.dragmode: zoom`, touches initially zoom, but selecting Touch Hover enables scrubbing while mouse dragging still zooms.
+
+Native tool selections and legend visibility are preserved across ordinary rerenders. Cards without `touch_hover: true` keep their existing touch behavior and toolbar.
+
+If an expression changes `touch_hover` to false, the button disappears and future touches use native handling; an already-owned gesture still completes safely. Re-enabling the expression restores availability without resetting the selected tool. Reloading the card configuration establishes a new initial selection.
+
+While Touch Hover is selected, a stationary plot touch retains Plotly click behavior, dragging scrubs without clicking, and touching a visible tooltip over the main plot dismisses it. Axes and other controls remain native. One-finger double-tap-drag zoom is replaced by Hover in this mode; two-finger custom pinch remains available unless `disable_pinch_to_zoom` is set. Disabling pinch does not disable Touch Hover.
+
 ## hours_to_show:
 
 How many hours are shown.
