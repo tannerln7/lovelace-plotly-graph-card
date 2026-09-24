@@ -74,6 +74,7 @@ export type InputConfig = {
   significant_changes_only?: boolean; // defaults to false
   minimal_response?: boolean; // defaults to true
   disable_pinch_to_zoom?: boolean; // defaults to false
+  touch_hover?: boolean; // defaults to false
   autorange_after_scroll?: boolean; // defaults to false
   preset?: string | string[];
 };
@@ -107,6 +108,7 @@ export type Config = {
   significant_changes_only: boolean;
   minimal_response: boolean;
   disable_pinch_to_zoom: boolean;
+  touch_hover: boolean;
   visible_range: [number, number];
   on_dblclick: Function;
   autorange_after_scroll: boolean;
