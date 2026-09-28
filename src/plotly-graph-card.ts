@@ -15,7 +15,7 @@ import isProduction from "./is-production";
 import "./hot-reload";
 import { debounce, sleep } from "./utils";
 import { parseISO } from "date-fns";
-import { TouchController } from "./touch-controller";
+import { PlotlyTouchAdapter, TouchController } from "./touch";
 import { ConfigParser } from "./parse-config/parse-config";
 import { merge } from "lodash";
 import { getFetchMask } from "./plot-state";
@@ -130,11 +130,12 @@ export class PlotlyGraph extends HTMLElement {
     insertStyleHack(shadow.querySelector("style")!);
     this.contentEl.style.visibility = "hidden";
     this.touchController = new TouchController({
-      el: this.contentEl,
-      onZoomStart: () => {
+      root: this.contentEl,
+      plotly: new PlotlyTouchAdapter(this.contentEl),
+      onGestureStart: () => {
         this.pausedRendering = true;
       },
-      onZoomEnd: () => {
+      onGestureEnd: () => {
         this.pausedRendering = false;
         this.plot({ should_fetch: true });
       },
