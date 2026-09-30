@@ -65,6 +65,14 @@ export class HoverSession extends OwnedTouchSession {
     }
   }
 
+  cancel(): void {
+    try {
+      super.cancel();
+    } finally {
+      this.plotly.clearHover();
+    }
+  }
+
   protected handleOwnedEvent(event: TouchEvent): TouchSessionResult {
     const touch = findTouch(event.touches, this.contact.identifier);
     if (event.touches.length !== 1 || !touch) {

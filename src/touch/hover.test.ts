@@ -1,4 +1,5 @@
 import type { ClaimTouch, TouchSession } from "./contracts";
+import { TouchController } from "./controller";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
@@ -164,6 +165,42 @@ describe("HoverSession", () => {
       observation,
       cancellation,
     );
+    expect(plotly.clearHover).toHaveBeenCalledTimes(1);
+    expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TouchController hover cancellation", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it("clears active hover and releases its observation once when a feature gate changes", () => {
+    const plotly = adapter();
+    const listeners = new Map<string, EventListener>();
+    const root = {
+      addEventListener: jest.fn(
+        (type: string, listener: EventListenerOrEventListenerObject) =>
+          listeners.set(type, listener as EventListener),
+      ),
+      removeEventListener: jest.fn(),
+    } as unknown as HTMLElement;
+    const controller = new TouchController({
+      root,
+      plotly,
+      onGestureStart: jest.fn(),
+      onGestureEnd: jest.fn(),
+    });
+    controller.isEnabled = false;
+    controller.touchHoverEnabled = true;
+    controller.connect();
+
+    listeners.get("touchstart")?.(event("touchstart", [touch(7, 10, 20)]));
+    jest.advanceTimersByTime(LONG_PRESS_MS);
+    expect(plotly.showHover).toHaveBeenCalledTimes(1);
+    plotly.clearHover.mockClear();
+
+    controller.isEnabled = true;
+
     expect(plotly.clearHover).toHaveBeenCalledTimes(1);
     expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
   });

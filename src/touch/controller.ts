@@ -88,9 +88,9 @@ export interface TouchControllerOptions {
 export class TouchController {
   /**
    * ARCHITECTURE SCAFFOLD:
-   * Independent zoom/hover feature gates. Disabling either gate cancels only
-   * an owner of that capability and resets all candidates; enabled recognizers
-   * may continue observing while native Plotly remains the default.
+   * Independent zoom/hover feature gates. Changing either gate cancels any
+   * current custom owner and resets all candidates; enabled recognizers may
+   * continue observing while native Plotly remains the default.
    */
   private zoomEnabled = true;
   private hoverEnabled = false;
@@ -145,7 +145,8 @@ export class TouchController {
    * Disable recognition immediately and cancel/reset custom state exactly once.
    *
    * Interactions:
-   * `PlotlyGraph.setConfig` sets this from `disable_pinch_to_zoom`.
+   * `PlotlyGraph` synchronizes this from parsed `disable_pinch_to_zoom`
+   * configuration during its parsing/render lifecycle.
    *
    * Owns:
    * Controller enablement only.
