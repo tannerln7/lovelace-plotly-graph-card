@@ -80,9 +80,15 @@ try {
       };
 
       const events = { starts: 0, ends: 0, clicks: 0, doubles: 0 };
+      const touchStartLengths = [];
       const wheels = [];
       gd.on("plotly_click", () => (events.clicks += 1));
       gd.on("plotly_doubleclick", () => (events.doubles += 1));
+      gd.addEventListener(
+        "touchstart",
+        (event) => touchStartLengths.push(event.touches.length),
+        { capture: true },
+      );
       const adapter = new TouchPinchTest.PlotlyTouchAdapter(gd);
       const controller = new TouchPinchTest.TouchController({
         root: gd,
@@ -99,7 +105,14 @@ try {
           clientY: event.clientY,
         }),
       );
-      window.fixture = { gd, controller, events, tracked, wheels };
+      window.fixture = {
+        gd,
+        controller,
+        events,
+        touchStartLengths,
+        tracked,
+        wheels,
+      };
       const bounds = dragger.getBoundingClientRect();
       return {
         left: bounds.left,
@@ -125,7 +138,8 @@ try {
     };
     const snapshot = () =>
       page.evaluate(() => {
-        const { gd, events, tracked, wheels } = window.fixture;
+        const { gd, events, touchStartLengths, tracked, wheels } =
+          window.fixture;
         const marker = gd
           .querySelector(".scatterlayer .point")
           ?.getBoundingClientRect();
@@ -142,6 +156,7 @@ try {
             end: tracked.touchend.size,
           },
           events: { ...events },
+          touchStartLengths: [...touchStartLengths],
           wheels: wheels.map((wheel) => ({ ...wheel })),
         };
       });
@@ -190,6 +205,67 @@ try {
       clicks: 0,
       doubles: 0,
     });
+    assert.deepEqual(f.errors, []);
+    await f.page.close();
+  }
+
+  // Dispatch both contacts in the first CDP touchStart. Chromium exposes this
+  // as sequential one- and two-contact DOM starts (unlike the observed iOS
+  // shape), while the unit test covers one initial DOM event containing both.
+  {
+    const f = await fixture();
+    const cx = (f.rect.left + f.rect.right) / 2;
+    const cy = (f.rect.top + f.rect.bottom) / 2 + 100;
+    const a = f.point(3, cx - 40, cy);
+    const b = f.point(4, cx + 40, cy);
+    await f.send("touchStart", [a, b]);
+    let state = await f.snapshot();
+    assert.deepEqual(state.touchStartLengths, [1, 2]);
+    assert.deepEqual(state.events, {
+      starts: 1,
+      ends: 0,
+      clicks: 0,
+      doubles: 0,
+    });
+    assert.equal(state.wheels.length, 0);
+
+    await f.send("touchMove", [
+      f.point(4, cx + 55, cy),
+      f.point(3, cx - 55, cy),
+    ]);
+    await f.page.waitForTimeout(80);
+    state = await f.snapshot();
+    assert.deepEqual(state.events, {
+      starts: 1,
+      ends: 0,
+      clicks: 0,
+      doubles: 0,
+    });
+    assert.deepEqual(state.wheels, [
+      { deltaY: -30, clientX: cx, clientY: cy },
+    ]);
+    assert(span(state.fullX) < 100, "the first pinch move must zoom in");
+    assert(closeEnough((state.fullX[0] + state.fullX[1]) / 2, 50, 0.05));
+
+    await f.send("touchEnd", [f.point(3, cx - 55, cy)]);
+    await f.send("touchEnd", []);
+    await f.page.waitForTimeout(80);
+    state = await f.snapshot();
+    assert.deepEqual(state.events, {
+      starts: 1,
+      ends: 1,
+      clicks: 0,
+      doubles: 0,
+    });
+    assert.deepEqual(state.listeners, { move: 0, end: 0 });
+    assert.equal(state.dragging, false);
+    assert.equal(state.dragged, false);
+    assert.equal(state.hasDragData, false);
+    assert(
+      state.layoutX.every((value, index) =>
+        closeEnough(value, state.fullX[index]),
+      ),
+    );
     assert.deepEqual(f.errors, []);
     await f.page.close();
   }

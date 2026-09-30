@@ -92,7 +92,110 @@ describe("PinchRecognizer", () => {
     recognizer.reset();
     expect(plotly.releaseNativeObservation).not.toHaveBeenCalled();
     session?.handle(recognitionEvent);
-    expect(recognitionEvent.preventDefault).toHaveBeenCalled();
+    expect(recognitionEvent.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers a simultaneous start until movement and applies its first spread delta once", () => {
+    const plotly = adapter();
+    const recognizer = new PinchRecognizer(plotly);
+    const start = event("touchstart", [touch(1, 0, 10), touch(2, 80, 10)]);
+
+    expect(handle(recognizer, start)).toBeUndefined();
+    expect(start.preventDefault).not.toHaveBeenCalled();
+    expect(start.stopPropagation).not.toHaveBeenCalled();
+    expect(plotly.acquireNativeObservation).toHaveBeenCalledWith(surface, 1);
+    expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
+
+    const recognitionMove = event("touchmove", [
+      touch(2, 90, 10),
+      touch(1, -10, 10),
+    ]);
+    const session = handle(recognizer, recognitionMove);
+
+    expect(session).toBeInstanceOf(PinchSession);
+    expect(plotly.takeOverNativeGesture).toHaveBeenCalledWith(observation);
+    expect(plotly.zoom).not.toHaveBeenCalled();
+    session?.handle(recognitionMove);
+    expect(plotly.zoom).toHaveBeenCalledTimes(1);
+    expect(plotly.zoom).toHaveBeenCalledWith(
+      surface,
+      { clientX: 40, clientY: 10 },
+      20,
+    );
+    expect(recognitionMove.preventDefault).toHaveBeenCalledTimes(1);
+    expect(plotly.releaseNativeObservation).not.toHaveBeenCalled();
+  });
+
+  it("ignores an initial simultaneous start on different surfaces", () => {
+    const plotly = adapter();
+    const otherSurface = {} as PlotlyTouchSurface;
+    plotly.resolveSurface
+      .mockReturnValueOnce(surface)
+      .mockReturnValueOnce(otherSurface);
+    const recognizer = new PinchRecognizer(plotly);
+
+    const session = handle(
+      recognizer,
+      event("touchstart", [touch(1, 0, 10), touch(2, 80, 10)]),
+    );
+
+    expect(session).toBeUndefined();
+    expect(plotly.acquireNativeObservation).not.toHaveBeenCalled();
+    expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
+  });
+
+  it.each(["touchend", "touchcancel"])(
+    "releases a simultaneous candidate on %s before movement",
+    (type) => {
+      const plotly = adapter();
+      const recognizer = new PinchRecognizer(plotly);
+      handle(
+        recognizer,
+        event("touchstart", [touch(1, 0, 10), touch(2, 80, 10)]),
+      );
+
+      handle(recognizer, event(type, []));
+
+      expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
+      expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
+      expect(plotly.releaseNativeObservation).toHaveBeenCalledWith(observation);
+    },
+  );
+
+  it("rejects identifier replacement before simultaneous recognition", () => {
+    const plotly = adapter();
+    const recognizer = new PinchRecognizer(plotly);
+    handle(
+      recognizer,
+      event("touchstart", [touch(1, 0, 10), touch(2, 80, 10)]),
+    );
+
+    const session = handle(
+      recognizer,
+      event("touchmove", [touch(1, -10, 10), touch(3, 90, 10)]),
+    );
+
+    expect(session).toBeUndefined();
+    expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
+    expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases a simultaneous candidate when atomic takeover fails", () => {
+    const plotly = adapter(false);
+    const recognizer = new PinchRecognizer(plotly);
+    handle(
+      recognizer,
+      event("touchstart", [touch(1, 0, 10), touch(2, 80, 10)]),
+    );
+
+    const session = handle(
+      recognizer,
+      event("touchmove", [touch(1, -10, 10), touch(2, 90, 10)]),
+    );
+
+    expect(session).toBeUndefined();
+    expect(plotly.takeOverNativeGesture).toHaveBeenCalledWith(observation);
+    expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
   });
 
   it("does not claim when atomic native takeover reports an inactive gesture", () => {

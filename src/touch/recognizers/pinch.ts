@@ -3,7 +3,13 @@ import type {
   TouchContactIdentity,
   TouchRecognizer,
 } from "../contracts";
-import { findTouch, touchContact } from "../geometry";
+import {
+  findTouch,
+  touchContact,
+  touchDistance,
+  touchPoint,
+} from "../geometry";
+import type { ClientPoint } from "../geometry";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
@@ -15,17 +21,28 @@ import { PinchSession } from "../sessions/pinch";
  * Adapter-local mechanics remain opaque while this context pairs one observed
  * first contact with the lease that must either be released or transferred.
  */
-interface PinchCandidate {
+interface SinglePinchCandidate {
+  readonly kind: "single";
   readonly contact: TouchContactIdentity;
   readonly observation: NativeGestureObservation;
 }
+
+interface SimultaneousPinchCandidate {
+  readonly kind: "simultaneous";
+  readonly contacts: readonly [TouchContactIdentity, TouchContactIdentity];
+  readonly observation: NativeGestureObservation;
+  readonly anchor: ClientPoint;
+  readonly initialSpread: number;
+}
+
+type PinchCandidate = SinglePinchCandidate | SimultaneousPinchCandidate;
 
 /**
  * ARCHITECTURE SCAFFOLD:
  *
  * Purpose:
- * Recognize when an unowned native one-finger interaction becomes a valid
- * same-surface two-contact custom pinch.
+ * Recognize when an unowned native interaction becomes a valid same-surface
+ * two-contact custom pinch.
  *
  * Responsibility:
  * Track contact identity and original surface long enough to validate exactly
@@ -47,10 +64,11 @@ interface PinchCandidate {
  * or remain active beside an owning session.
  *
  * Implementation:
- * Intercept the second start in root capture only after both original targets
- * resolve to the same eligible surface. Request one atomic semantic native
- * takeover; the adapter selects its private pre-pan or post-pan mechanism. The
- * owning session handles the recognition event and subsequent drain behavior.
+ * A staggered second start claims immediately after both original targets
+ * resolve to one surface. When the first observed start already contains two
+ * contacts, retain their initial geometry without suppression and claim on the
+ * first valid move, after Plotly has initialized its native state. The adapter
+ * selects its private pre-pan or post-pan takeover mechanism in either path.
  */
 export class PinchRecognizer implements TouchRecognizer {
   /**
@@ -89,14 +107,24 @@ export class PinchRecognizer implements TouchRecognizer {
    */
   handle(event: TouchEvent, claim: ClaimTouch): void {
     if (!this.candidate) {
-      if (event.type === "touchstart" && event.touches.length === 1) {
-        this.beginCandidate(event.touches[0]);
+      if (event.type === "touchstart") {
+        if (event.touches.length === 1) {
+          this.beginSingleCandidate(event.touches[0]);
+        } else if (event.touches.length === 2) {
+          this.beginSimultaneousCandidate(event.touches[0], event.touches[1]);
+        }
       }
       return;
     }
 
+    if (this.candidate.kind === "simultaneous") {
+      if (event.type === "touchmove") this.tryClaimSimultaneous(event, claim);
+      else this.reset();
+      return;
+    }
+
     if (event.type === "touchstart") {
-      this.tryClaim(event, claim);
+      this.tryClaimStaggered(event, claim);
       return;
     }
     if (
@@ -140,10 +168,11 @@ export class PinchRecognizer implements TouchRecognizer {
     this.candidate = undefined;
   }
 
-  private beginCandidate(touch: Touch): void {
+  private beginSingleCandidate(touch: Touch): void {
     const surface = this.plotly.resolveSurface(touch);
     if (!surface) return;
     this.candidate = {
+      kind: "single",
       contact: touchContact(touch, surface),
       observation: this.plotly.acquireNativeObservation(
         surface,
@@ -152,9 +181,34 @@ export class PinchRecognizer implements TouchRecognizer {
     };
   }
 
-  private tryClaim(event: TouchEvent, claim: ClaimTouch): void {
+  private beginSimultaneousCandidate(first: Touch, second: Touch): void {
+    const surface = this.plotly.resolveSurface(first);
+    if (!surface || this.plotly.resolveSurface(second) !== surface) return;
+
+    const firstPoint = touchPoint(first);
+    const secondPoint = touchPoint(second);
+    this.candidate = {
+      kind: "simultaneous",
+      contacts: [touchContact(first, surface), touchContact(second, surface)],
+      observation: this.plotly.acquireNativeObservation(
+        surface,
+        first.identifier,
+      ),
+      anchor: {
+        clientX: (firstPoint.clientX + secondPoint.clientX) / 2,
+        clientY: (firstPoint.clientY + secondPoint.clientY) / 2,
+      },
+      initialSpread: touchDistance(first, second),
+    };
+  }
+
+  private tryClaimStaggered(event: TouchEvent, claim: ClaimTouch): void {
     const candidate = this.candidate;
-    if (!candidate || event.touches.length !== 2) {
+    if (
+      !candidate ||
+      candidate.kind !== "single" ||
+      event.touches.length !== 2
+    ) {
       this.reset();
       return;
     }
@@ -183,6 +237,46 @@ export class PinchRecognizer implements TouchRecognizer {
       candidate.observation,
       [candidate.contact, touchContact(second, candidate.contact.surface)],
       [first, second],
+    );
+    this.candidate = undefined;
+    if (!claim(session)) session.cancel();
+  }
+
+  private tryClaimSimultaneous(event: TouchEvent, claim: ClaimTouch): void {
+    const candidate = this.candidate;
+    if (
+      !candidate ||
+      candidate.kind !== "simultaneous" ||
+      event.touches.length !== 2
+    ) {
+      this.reset();
+      return;
+    }
+
+    const first = findTouch(event.touches, candidate.contacts[0].identifier);
+    const second = findTouch(event.touches, candidate.contacts[1].identifier);
+    const surface = candidate.contacts[0].surface;
+    if (
+      !first ||
+      !second ||
+      this.plotly.resolveSurface(first) !== surface ||
+      this.plotly.resolveSurface(second) !== surface
+    ) {
+      this.reset();
+      return;
+    }
+
+    if (!this.plotly.takeOverNativeGesture(candidate.observation)) {
+      this.reset();
+      return;
+    }
+
+    const session = new PinchSession(
+      this.plotly,
+      candidate.observation,
+      candidate.contacts,
+      candidate.anchor,
+      candidate.initialSpread,
     );
     this.candidate = undefined;
     if (!claim(session)) session.cancel();
