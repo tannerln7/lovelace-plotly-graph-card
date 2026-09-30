@@ -88,9 +88,21 @@ export type TouchSessionResult = TouchSession | null | undefined;
  * until end/cancel or transfer directly to another session.
  */
 export interface TouchSession {
+  /** Whether this ownership changes the visible Plotly viewport. */
+  readonly changesViewport: boolean;
   handle(event: TouchEvent): TouchSessionResult;
   cancel(): void;
 }
+
+/**
+ * Install a recognized session as the sole custom owner.
+ *
+ * The controller supplies this capability to recognizers. It may be invoked
+ * during `handle` or retained by a recognizer whose decision depends on its
+ * own timer. `false` means ownership is no longer available or recognition is
+ * disabled.
+ */
+export type ClaimTouch = (session: TouchSession) => boolean;
 
 /**
  * ARCHITECTURE SCAFFOLD:
@@ -101,12 +113,14 @@ export interface TouchSession {
  *
  * Responsibility:
  * Retain only candidate state, avoid suppressing observational events, and
- * return a fully initialized session when recognition becomes definitive.
+ * request ownership with a fully initialized session when recognition becomes
+ * definitive.
  *
  * Interactions:
  * Called in controller-defined priority order only while there is no owner.
- * On claim, all recognizers reset and the returned session receives the same
- * recognition event exactly once.
+ * On an accepted synchronous claim, all recognizers reset and the new session
+ * receives the same recognition event exactly once. A recognizer may retain
+ * `claim` for a locally timed decision; no event is fabricated in that case.
  *
  * Owns:
  * Candidate recognition state only.
@@ -117,9 +131,10 @@ export interface TouchSession {
  *
  * Future implementation:
  * Use the semantic adapter to resolve surfaces and request atomic native
- * takeover immediately before returning a session.
+ * takeover immediately before requesting ownership. `reset()` must invalidate
+ * every retained claim callback and release untransferred resources.
  */
 export interface TouchRecognizer {
-  handle(event: TouchEvent): TouchSession | undefined;
+  handle(event: TouchEvent, claim: ClaimTouch): void;
   reset(): void;
 }

@@ -1,3 +1,4 @@
+import type { ClaimTouch, TouchSession } from "./contracts";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
@@ -34,6 +35,16 @@ const event = (type: string, touches: Touch[]) =>
     stopImmediatePropagation: jest.fn(),
   }) as unknown as TouchEvent;
 
+const handle = (recognizer: PinchRecognizer, value: TouchEvent) => {
+  let session: TouchSession | undefined;
+  const claim: ClaimTouch = (candidate) => {
+    session = candidate;
+    return true;
+  };
+  recognizer.handle(value, claim);
+  return session;
+};
+
 const adapter = (takeover = true) => {
   const value: jest.Mocked<PlotlyTouchAdapterContract> = {
     resolveSurface: jest.fn((_touch: Touch) => surface),
@@ -44,6 +55,9 @@ const adapter = (takeover = true) => {
       (_observation: NativeGestureObservation) => takeover,
     ),
     zoom: jest.fn(),
+    showHover: jest.fn(),
+    clearHover: jest.fn(),
+    preserveHoverThroughNativeTouchEnd: jest.fn(),
     cleanupCancelledGesture: jest.fn(),
     releaseNativeObservation: jest.fn(),
   };
@@ -55,13 +69,13 @@ const recognize = (
   firstCurrent = touch(1, 20, 30),
 ) => {
   const recognizer = new PinchRecognizer(plotly);
-  recognizer.handle(event("touchstart", [touch(1, 10, 30)]));
-  recognizer.handle(event("touchmove", [firstCurrent]));
+  handle(recognizer, event("touchstart", [touch(1, 10, 30)]));
+  handle(recognizer, event("touchmove", [firstCurrent]));
   const recognitionEvent = event("touchstart", [
     touch(2, 40, 30),
     firstCurrent,
   ]);
-  const session = recognizer.handle(recognitionEvent);
+  const session = handle(recognizer, recognitionEvent);
   return { recognitionEvent, recognizer, session };
 };
 
@@ -97,8 +111,9 @@ describe("PinchRecognizer", () => {
       .mockReturnValueOnce(surface)
       .mockReturnValueOnce(otherSurface);
     const recognizer = new PinchRecognizer(plotly);
-    recognizer.handle(event("touchstart", [touch(1, 10, 10)]));
-    const session = recognizer.handle(
+    handle(recognizer, event("touchstart", [touch(1, 10, 10)]));
+    const session = handle(
+      recognizer,
       event("touchstart", [touch(1, 10, 10), touch(2, 30, 10)]),
     );
 
@@ -110,8 +125,8 @@ describe("PinchRecognizer", () => {
   it("releases an unclaimed observation when the first contact ends", () => {
     const plotly = adapter();
     const recognizer = new PinchRecognizer(plotly);
-    recognizer.handle(event("touchstart", [touch(1, 10, 10)]));
-    recognizer.handle(event("touchend", []));
+    handle(recognizer, event("touchstart", [touch(1, 10, 10)]));
+    handle(recognizer, event("touchend", []));
 
     expect(plotly.releaseNativeObservation).toHaveBeenCalledWith(observation);
   });

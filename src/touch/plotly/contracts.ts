@@ -207,6 +207,19 @@ export interface PlotlyTouchAdapterContract {
    */
   zoom(surface: PlotlyTouchSurface, anchor: ClientPoint, delta: number): void;
 
+  /** Show or update touch hover on the exact retained Cartesian surface. */
+  showHover(surface: PlotlyTouchSurface, point: ClientPoint): void;
+
+  /** Clear visible and queued Plotly hover state. */
+  clearHover(): void;
+
+  /**
+   * Reconcile hover after Plotly's native final touch completion has run.
+   * `true` restores the adapter's latest custom hover; `false` clears native
+   * tap hover. The adapter owns the Plotly-version-specific scheduling.
+   */
+  preserveHoverThroughNativeTouchEnd(preserveCurrent: boolean): void;
+
   /**
    * ARCHITECTURE SCAFFOLD:
    *

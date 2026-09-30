@@ -374,6 +374,7 @@ export class PlotlyGraph extends HTMLElement {
     this.config = config;
     const is = this.config;
     this.touchController.isEnabled = !is.disable_pinch_to_zoom;
+    this.touchController.touchHoverEnabled = Boolean(is.touch_hover);
     this.exitBrowsingMode();
   }
   getCSSVars() {

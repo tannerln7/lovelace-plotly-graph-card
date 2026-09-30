@@ -1,3 +1,4 @@
+import type { ClaimTouch, TouchSession } from "./contracts";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
@@ -38,6 +39,16 @@ const event = (type: string, touches: Touch[], changedTouches: Touch[] = []) =>
     stopImmediatePropagation: jest.fn(),
   }) as unknown as TouchEvent;
 
+const handle = (recognizer: DoubleTapDragRecognizer, value: TouchEvent) => {
+  let session: TouchSession | undefined;
+  const claim: ClaimTouch = (candidate) => {
+    session = candidate;
+    return true;
+  };
+  recognizer.handle(value, claim);
+  return session;
+};
+
 const adapter = (takeover = true) => {
   const value: jest.Mocked<PlotlyTouchAdapterContract> = {
     resolveSurface: jest.fn((value: Touch) =>
@@ -50,6 +61,9 @@ const adapter = (takeover = true) => {
       (_observation: NativeGestureObservation) => takeover,
     ),
     zoom: jest.fn(),
+    showHover: jest.fn(),
+    clearHover: jest.fn(),
+    preserveHoverThroughNativeTouchEnd: jest.fn(),
     cleanupCancelledGesture: jest.fn(),
     releaseNativeObservation: jest.fn(),
   };
@@ -60,8 +74,8 @@ const cleanFirstTap = (
   recognizer: DoubleTapDragRecognizer,
   point = touch(1, 10, 20),
 ) => {
-  recognizer.handle(event("touchstart", [point], [point]));
-  recognizer.handle(event("touchend", [], [point]));
+  handle(recognizer, event("touchstart", [point], [point]));
+  handle(recognizer, event("touchend", [], [point]));
 };
 
 describe("DoubleTapDragRecognizer", () => {
@@ -82,7 +96,8 @@ describe("DoubleTapDragRecognizer", () => {
     expect(plotly.acquireNativeObservation).not.toHaveBeenCalled();
 
     now += 100;
-    recognizer.handle(
+    handle(
+      recognizer,
       event("touchstart", [touch(2, 25, 20)], [touch(2, 25, 20)]),
     );
     expect(plotly.acquireNativeObservation).toHaveBeenCalledWith(surface, 2);
@@ -94,21 +109,23 @@ describe("DoubleTapDragRecognizer", () => {
       const plotly = adapter();
       const recognizer = new DoubleTapDragRecognizer(plotly);
       const first = touch(1, 10, 20);
-      recognizer.handle(event("touchstart", [first], [first]));
+      handle(recognizer, event("touchstart", [first], [first]));
 
       if (reason === "movement") {
-        recognizer.handle(event("touchmove", [touch(1, 18, 20)]));
-        recognizer.handle(event("touchend", [], [touch(1, 18, 20)]));
+        handle(recognizer, event("touchmove", [touch(1, 18, 20)]));
+        handle(recognizer, event("touchend", [], [touch(1, 18, 20)]));
       } else if (reason === "second contact") {
-        recognizer.handle(
+        handle(
+          recognizer,
           event("touchstart", [first, touch(2, 20, 20)], [touch(2, 20, 20)]),
         );
       } else {
-        recognizer.handle(event("touchcancel", [], [first]));
+        handle(recognizer, event("touchcancel", [], [first]));
       }
 
       now += 50;
-      recognizer.handle(
+      handle(
+        recognizer,
         event("touchstart", [touch(3, 10, 20)], [touch(3, 10, 20)]),
       );
       expect(plotly.acquireNativeObservation).not.toHaveBeenCalled();
@@ -129,7 +146,7 @@ describe("DoubleTapDragRecognizer", () => {
 
       now += delay;
       const second = touch(2, 10 + distance, 20, secondTarget);
-      recognizer.handle(event("touchstart", [second], [second]));
+      handle(recognizer, event("touchstart", [second], [second]));
       expect(plotly.acquireNativeObservation).toHaveBeenCalledTimes(
         matches ? 1 : 0,
       );
@@ -142,14 +159,14 @@ describe("DoubleTapDragRecognizer", () => {
     cleanFirstTap(recognizer);
     now += 50;
     const second = touch(2, 10, 20);
-    recognizer.handle(event("touchstart", [second], [second]));
+    handle(recognizer, event("touchstart", [second], [second]));
     const move = event("touchmove", [touch(2, 10, 27)]);
 
-    expect(recognizer.handle(move)).toBeUndefined();
+    expect(handle(recognizer, move)).toBeUndefined();
     expect(move.preventDefault).not.toHaveBeenCalled();
     expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
 
-    recognizer.handle(event("touchend", [], [touch(2, 10, 27)]));
+    handle(recognizer, event("touchend", [], [touch(2, 10, 27)]));
     expect(plotly.releaseNativeObservation).toHaveBeenCalledWith(observation);
   });
 
@@ -159,10 +176,10 @@ describe("DoubleTapDragRecognizer", () => {
     cleanFirstTap(recognizer);
     now += 50;
     const second = touch(2, 10, 20);
-    recognizer.handle(event("touchstart", [second], [second]));
+    handle(recognizer, event("touchstart", [second], [second]));
     const crossing = event("touchmove", [touch(2, 10, 28)]);
 
-    const session = recognizer.handle(crossing);
+    const session = handle(recognizer, crossing);
     expect(session).toBeInstanceOf(DragZoomSession);
     expect(plotly.takeOverNativeGesture).toHaveBeenCalledWith(observation);
     expect(plotly.releaseNativeObservation).not.toHaveBeenCalled();
@@ -190,10 +207,10 @@ describe("DoubleTapDragRecognizer", () => {
     cleanFirstTap(recognizer);
     now += 50;
     const second = touch(2, 10, 20);
-    recognizer.handle(event("touchstart", [second], [second]));
+    handle(recognizer, event("touchstart", [second], [second]));
 
     expect(
-      recognizer.handle(event("touchmove", [touch(2, 18, 20)])),
+      handle(recognizer, event("touchmove", [touch(2, 18, 20)])),
     ).toBeUndefined();
     expect(plotly.releaseNativeObservation).toHaveBeenCalledWith(observation);
   });

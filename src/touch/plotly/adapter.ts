@@ -1,4 +1,5 @@
 import Plotly from "../../plotly";
+import type { ClientPoint } from "../geometry";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
@@ -6,6 +7,25 @@ import type {
 } from "./contracts";
 
 type RelayoutListener = (update: Plotly.PlotRelayoutEvent) => void;
+
+interface PlotlyFxApi {
+  hover(
+    root: Plotly.PlotlyHTMLElement,
+    event: ClientPoint & {
+      readonly target: Element;
+      readonly hovermode: string;
+    },
+    subplot: string,
+  ): void;
+  unhover(root: Plotly.PlotlyHTMLElement): void;
+}
+
+interface HoverRequest {
+  readonly surface: PlotlyTouchSurface;
+  readonly point: ClientPoint;
+}
+
+const plotlyFx = (Plotly as unknown as { Fx: PlotlyFxApi }).Fx;
 
 /**
  * ARCHITECTURE SCAFFOLD:
@@ -37,6 +57,7 @@ interface ObservedPlotlyRoot extends Plotly.PlotlyHTMLElement {
   _dragged?: boolean;
   _dragdata?: { element?: Element };
   _mouseDownTime?: number;
+  _fullLayout?: { hovermode?: string | false };
   removeListener(event: "plotly_relayouting", listener: RelayoutListener): void;
 }
 
@@ -159,6 +180,7 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
    * Coordinate across graphs or imply event suppression.
    */
   private activeObservation?: NativeObservationRecord;
+  private latestCustomHover?: HoverRequest;
 
   constructor(root: Plotly.PlotlyHTMLElement) {
     this.root = root as ObservedPlotlyRoot;
@@ -339,6 +361,53 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
     delta: number,
   ): void {
     this.dispatchWheel(this.getSurfaceElement(surface), anchor, -delta);
+  }
+
+  /**
+   * Render custom touch hover through Plotly's own Fx pipeline. The adapter
+   * supplies the exact dragger target/subplot and maps `closest` to `x`, which
+   * makes touch hover useful without requiring the finger to hit a marker.
+   */
+  showHover(surface: PlotlyTouchSurface, point: ClientPoint): void {
+    const request = {
+      surface,
+      point: { clientX: point.clientX, clientY: point.clientY },
+    };
+    this.latestCustomHover = request;
+    this.renderHover(request);
+  }
+
+  /** Clear both rendered hover and Plotly's throttled pending hover callback. */
+  clearHover(): void {
+    this.latestCustomHover = undefined;
+    plotlyFx.unhover(this.root);
+  }
+
+  /**
+   * Let Plotly finish native click/double-click bookkeeping first, then remove
+   * native tap hover or restore the custom long-press hover before the next
+   * paint. A microtask is too early in Shadow DOM: it can run before Plotly's
+   * document-level touchend closure. The wrapped `Fx.unhover` call also
+   * cancels Plotly's queued hover throttle.
+   */
+  preserveHoverThroughNativeTouchEnd(preserveCurrent: boolean): void {
+    const preserved = preserveCurrent ? this.latestCustomHover : undefined;
+    const afterNativeCompletion = (): void => {
+      // A later sequence may have cleared or replaced this request while the
+      // browser was waiting to run the frame callback. Never let stale
+      // completion work erase that newer state.
+      if (preserved) {
+        if (this.latestCustomHover !== preserved) return;
+      } else if (this.latestCustomHover) return;
+
+      plotlyFx.unhover(this.root);
+      if (preserved) this.renderHover(preserved);
+      else this.latestCustomHover = undefined;
+    };
+    const view = this.root.ownerDocument.defaultView;
+    if (view?.requestAnimationFrame)
+      view.requestAnimationFrame(afterNativeCompletion);
+    else setTimeout(afterNativeCompletion, 0);
   }
 
   /**
@@ -525,6 +594,18 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
       throw new Error("Plotly touch surface does not belong to this adapter");
     }
     return element;
+  }
+
+  private renderHover(request: HoverRequest): void {
+    const element = this.getSurfaceElement(request.surface);
+    const configuredMode = this.root._fullLayout?.hovermode;
+    const hovermode =
+      configuredMode && configuredMode !== "closest" ? configuredMode : "x";
+    plotlyFx.hover(
+      this.root,
+      { ...request.point, target: element, hovermode },
+      element.getAttribute("data-subplot") || "xy",
+    );
   }
 
   private dispatchWheel(

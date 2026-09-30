@@ -1,6 +1,9 @@
 jest.mock("../../plotly", () => ({
   __esModule: true,
-  default: { relayout: jest.fn() },
+  default: {
+    relayout: jest.fn(),
+    Fx: { hover: jest.fn(), unhover: jest.fn() },
+  },
 }));
 
 import { PlotlyTouchAdapter } from "./adapter";
@@ -58,12 +61,25 @@ class FakeElement {
       toJSON: () => ({}),
     };
   }
+
+  getAttribute(name: string): string | null {
+    return name === "data-subplot" ? "xy" : null;
+  }
 }
 
 class FakePlotRoot extends FakeElement {
   _dragging?: boolean;
   _dragged?: boolean;
   _dragdata?: { element?: Element };
+  _fullLayout: { hovermode?: string | false } = { hovermode: "closest" };
+  readonly ownerDocument = {
+    defaultView: {
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        callback(0);
+        return 1;
+      },
+    },
+  };
 
   private readonly listeners = new Set<RelayoutListener>();
 
@@ -118,6 +134,8 @@ const getRecord = (
 };
 
 describe("PlotlyTouchAdapter native observation", () => {
+  beforeEach(() => jest.clearAllMocks());
+
   it("resolves and canonicalizes only touched Cartesian surfaces in its root", () => {
     const { adapter, child, dragger, root, touch } = makeFixture();
     const surface = adapter.resolveSurface(touch(child));
@@ -131,6 +149,70 @@ describe("PlotlyTouchAdapter native observation", () => {
     const foreignRoot = new FakePlotRoot();
     const foreignDragger = new FakeElement(["nsewdrag", "drag"], foreignRoot);
     expect(adapter.resolveSurface(touch(foreignDragger))).toBeUndefined();
+  });
+
+  it("routes hover through the exact surface and clears Plotly hover state", () => {
+    const { adapter, child, dragger, root, touch } = makeFixture();
+    const surface = adapter.resolveSurface(touch(child)) as PlotlyTouchSurface;
+    const fx = (
+      Plotly as unknown as {
+        Fx: { hover: jest.Mock; unhover: jest.Mock };
+      }
+    ).Fx;
+
+    adapter.showHover(surface, { clientX: 45, clientY: 67 });
+    expect(fx.hover).toHaveBeenLastCalledWith(
+      root,
+      {
+        clientX: 45,
+        clientY: 67,
+        hovermode: "x",
+        target: dragger,
+      },
+      "xy",
+    );
+
+    root._fullLayout.hovermode = "y unified";
+    adapter.showHover(surface, { clientX: 48, clientY: 70 });
+    expect(fx.hover).toHaveBeenLastCalledWith(
+      root,
+      expect.objectContaining({ hovermode: "y unified", target: dragger }),
+      "xy",
+    );
+
+    adapter.clearHover();
+    expect(fx.unhover).toHaveBeenLastCalledWith(root);
+  });
+
+  it("reconciles native completion without overwriting newer hover state", () => {
+    const { adapter, child, root, touch } = makeFixture();
+    const surface = adapter.resolveSurface(touch(child)) as PlotlyTouchSurface;
+    const fx = (
+      Plotly as unknown as {
+        Fx: { hover: jest.Mock; unhover: jest.Mock };
+      }
+    ).Fx;
+    const callbacks: FrameRequestCallback[] = [];
+    root.ownerDocument.defaultView.requestAnimationFrame = (callback) => {
+      callbacks.push(callback);
+      return callbacks.length;
+    };
+
+    adapter.showHover(surface, { clientX: 45, clientY: 67 });
+    fx.hover.mockClear();
+    adapter.preserveHoverThroughNativeTouchEnd(true);
+    callbacks.shift()?.(0);
+    expect(fx.unhover).toHaveBeenCalledTimes(1);
+    expect(fx.hover).toHaveBeenCalledTimes(1);
+
+    fx.hover.mockClear();
+    fx.unhover.mockClear();
+    adapter.preserveHoverThroughNativeTouchEnd(true);
+    adapter.clearHover();
+    fx.unhover.mockClear();
+    callbacks.shift()?.(0);
+    expect(fx.unhover).not.toHaveBeenCalled();
+    expect(fx.hover).not.toHaveBeenCalled();
   });
 
   it("shares one canonical record until its final lease is released", () => {

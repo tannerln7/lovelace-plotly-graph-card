@@ -37,6 +37,7 @@ import type {
  * its lease without releasing it after constructing the replacement owner.
  */
 export abstract class OwnedTouchSession implements TouchSession {
+  abstract readonly changesViewport: boolean;
   protected draining = false;
   private nativeCleanupPending = true;
   private cancellationCleanupRunning = false;

@@ -1,7 +1,7 @@
 import type {
+  ClaimTouch,
   TouchContactIdentity,
   TouchRecognizer,
-  TouchSession,
 } from "../contracts";
 import { findTouch, touchContact } from "../geometry";
 import type {
@@ -94,12 +94,11 @@ export class DoubleTapDragRecognizer implements TouchRecognizer {
    * native takeover only at definitive claim. The adapter privately selects the
    * required pre-pan or post-pan path, including click-train cleanup.
    */
-  handle(event: TouchEvent): TouchSession | undefined {
-    if (event.type === "touchstart") return this.handleStart(event);
-    if (event.type === "touchmove") return this.handleMove(event);
+  handle(event: TouchEvent, claim: ClaimTouch): void {
+    if (event.type === "touchstart") this.handleStart(event);
+    if (event.type === "touchmove") this.handleMove(event, claim);
     if (event.type === "touchend") this.handleEnd(event);
     if (event.type === "touchcancel") this.reset();
-    return undefined;
   }
 
   /**
@@ -133,17 +132,17 @@ export class DoubleTapDragRecognizer implements TouchRecognizer {
     this.completedTap = undefined;
   }
 
-  private handleStart(event: TouchEvent): TouchSession | undefined {
+  private handleStart(event: TouchEvent): void {
     if (this.candidate || event.touches.length !== 1) {
       this.reset();
-      return undefined;
+      return;
     }
 
     const touch = event.touches[0];
     const surface = this.plotly.resolveSurface(touch);
     if (!surface) {
       this.completedTap = undefined;
-      return undefined;
+      return;
     }
 
     const contact = touchContact(touch, surface);
@@ -161,27 +160,26 @@ export class DoubleTapDragRecognizer implements TouchRecognizer {
     } else {
       this.candidate = { kind: "first", contact };
     }
-    return undefined;
   }
 
-  private handleMove(event: TouchEvent): TouchSession | undefined {
+  private handleMove(event: TouchEvent, claim: ClaimTouch): void {
     const candidate = this.candidate;
-    if (!candidate) return undefined;
+    if (!candidate) return;
     const touch = findTouch(event.touches, candidate.contact.identifier);
     if (event.touches.length !== 1 || !touch) {
       this.reset();
-      return undefined;
+      return;
     }
-    if (!this.crossedThreshold(candidate.contact, touch)) return undefined;
+    if (!this.crossedThreshold(candidate.contact, touch)) return;
 
     if (candidate.kind === "first") {
       this.candidate = undefined;
-      return undefined;
+      return;
     }
 
     if (!this.plotly.takeOverNativeGesture(candidate.observation)) {
       this.clearCandidate();
-      return undefined;
+      return;
     }
 
     const session = new DragZoomSession(
@@ -190,7 +188,7 @@ export class DoubleTapDragRecognizer implements TouchRecognizer {
       candidate.contact,
     );
     this.candidate = undefined;
-    return session;
+    if (!claim(session)) session.cancel();
   }
 
   private handleEnd(event: TouchEvent): void {

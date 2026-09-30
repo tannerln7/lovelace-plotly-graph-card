@@ -37,6 +37,8 @@ import { OwnedTouchSession } from "./owned";
  * same-surface pinch; otherwise safely drain unsupported contacts.
  */
 export class DragZoomSession extends OwnedTouchSession {
+  readonly changesViewport = true;
+
   /**
    * ARCHITECTURE SCAFFOLD:
    * Gesture-specific mutable state is only the previous vertical coordinate.

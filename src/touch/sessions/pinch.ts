@@ -41,6 +41,8 @@ type TouchPair = readonly [TouchContactIdentity, TouchContactIdentity];
  * custom effects but remain suppressed until all owned contacts finish.
  */
 export class PinchSession extends OwnedTouchSession {
+  readonly changesViewport = true;
+
   /**
    * ARCHITECTURE SCAFFOLD:
    * Build the same pinch owner from either recognizer claim or direct session

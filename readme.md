@@ -1037,6 +1037,17 @@ disable_pinch_to_zoom: true # defaults to false
 
 When true, the custom implementations of pinch-to-zoom and double-tap-drag-to-zooming will be disabled.
 
+## touch_hover
+
+```yaml
+touch_hover: true # defaults to false
+```
+
+When enabled, press and hold on the plot to show a tooltip. Moving the held
+finger scrubs the tooltip across the plot, and releasing preserves the final
+tooltip until the next touch sequence begins. This setting is independent of
+`disable_pinch_to_zoom`.
+
 ## hours_to_show:
 
 How many hours are shown.

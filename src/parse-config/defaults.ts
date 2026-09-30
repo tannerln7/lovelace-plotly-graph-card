@@ -57,6 +57,7 @@ const defaultYamlRequired = {
   raw_plotly_config: false,
   ha_theme: true,
   disable_pinch_to_zoom: false,
+  touch_hover: false,
   raw_plotly: false,
   defaults: {
     entity: {},

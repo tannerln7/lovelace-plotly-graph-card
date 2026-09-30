@@ -1,7 +1,7 @@
 import type {
+  ClaimTouch,
   TouchContactIdentity,
   TouchRecognizer,
-  TouchSession,
 } from "../contracts";
 import { findTouch, touchContact } from "../geometry";
 import type {
@@ -30,7 +30,7 @@ interface PinchCandidate {
  * Responsibility:
  * Track contact identity and original surface long enough to validate exactly
  * two eligible contacts, request one atomic semantic native takeover, and
- * return a `PinchSession`.
+ * request ownership of a `PinchSession`.
  *
  * Interactions:
  * Called by `TouchController` only while no owner exists. It may query the
@@ -87,15 +87,18 @@ export class PinchRecognizer implements TouchRecognizer {
    * Build `PinchSession` with identifier-based contacts and a fixed initial
    * midpoint after completing the appropriate semantic native handoff.
    */
-  handle(event: TouchEvent): TouchSession | undefined {
+  handle(event: TouchEvent, claim: ClaimTouch): void {
     if (!this.candidate) {
       if (event.type === "touchstart" && event.touches.length === 1) {
         this.beginCandidate(event.touches[0]);
       }
-      return undefined;
+      return;
     }
 
-    if (event.type === "touchstart") return this.tryClaim(event);
+    if (event.type === "touchstart") {
+      this.tryClaim(event, claim);
+      return;
+    }
     if (
       event.type === "touchcancel" ||
       event.touches.length !== 1 ||
@@ -103,7 +106,6 @@ export class PinchRecognizer implements TouchRecognizer {
     ) {
       this.reset();
     }
-    return undefined;
   }
 
   /**
@@ -150,11 +152,11 @@ export class PinchRecognizer implements TouchRecognizer {
     };
   }
 
-  private tryClaim(event: TouchEvent): TouchSession | undefined {
+  private tryClaim(event: TouchEvent, claim: ClaimTouch): void {
     const candidate = this.candidate;
     if (!candidate || event.touches.length !== 2) {
       this.reset();
-      return undefined;
+      return;
     }
 
     const first = findTouch(event.touches, candidate.contact.identifier);
@@ -168,12 +170,12 @@ export class PinchRecognizer implements TouchRecognizer {
       this.plotly.resolveSurface(second) !== candidate.contact.surface
     ) {
       this.reset();
-      return undefined;
+      return;
     }
 
     if (!this.plotly.takeOverNativeGesture(candidate.observation)) {
       this.reset();
-      return undefined;
+      return;
     }
 
     const session = PinchSession.fromTouches(
@@ -183,6 +185,6 @@ export class PinchRecognizer implements TouchRecognizer {
       [first, second],
     );
     this.candidate = undefined;
-    return session;
+    if (!claim(session)) session.cancel();
   }
 }

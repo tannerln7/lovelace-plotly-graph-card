@@ -1,10 +1,12 @@
 import type { PlotlyTouchAdapterContract } from "./plotly/contracts";
 import type {
+  ClaimTouch,
   TouchRecognizer,
   TouchSession,
   TouchSessionResult,
 } from "./contracts";
 import { DoubleTapDragRecognizer } from "./recognizers/double-tap-drag";
+import { LongPressRecognizer } from "./recognizers/long-press";
 import { PinchRecognizer } from "./recognizers/pinch";
 
 const touchEvents = [
@@ -13,6 +15,11 @@ const touchEvents = [
   "touchend",
   "touchcancel",
 ] as const;
+
+interface RecognizerRegistration {
+  readonly recognizer: TouchRecognizer;
+  readonly enabled: () => boolean;
+}
 
 /**
  * ARCHITECTURE SCAFFOLD:
@@ -60,8 +67,9 @@ export interface TouchControllerOptions {
  *
  * Interactions:
  * While unowned, events are offered to recognizers without suppression. On the
- * first claim, all recognizers reset and the returned session receives that
- * recognition event exactly once. While owned, only the session receives
+ * first accepted claim, all recognizers reset. A claim made synchronously from
+ * `handle` receives that recognition event exactly once; a later timed claim
+ * starts without a fabricated event. While owned, only the session receives
  * events. Sessions call the semantic Plotly adapter directly.
  *
  * Owns:
@@ -69,9 +77,9 @@ export interface TouchControllerOptions {
  * balancing. No custom `plotly` owner exists: no claim means native behavior.
  *
  * Must not:
- * Recognize pinch or double-tap timing, query Plotly surfaces/private fields,
- * construct compatibility events, process relayout payloads, or coordinate
- * foreign graphs and mixed input globally.
+ * Recognize pinch, double-tap, or long-press timing; query Plotly
+ * surfaces/private fields; construct compatibility events; process relayout
+ * payloads; or coordinate foreign graphs and mixed input globally.
  *
  * Implementation:
  * Keep this class intentionally boring. Production integration contains no
@@ -80,10 +88,12 @@ export interface TouchControllerOptions {
 export class TouchController {
   /**
    * ARCHITECTURE SCAFFOLD:
-   * Whether unowned events may reach recognizers. Disabling cancels one active
-   * custom owner and resets candidates; native Plotly remains the default.
+   * Independent zoom/hover feature gates. Disabling either gate cancels only
+   * an owner of that capability and resets all candidates; enabled recognizers
+   * may continue observing while native Plotly remains the default.
    */
-  private enabled = true;
+  private zoomEnabled = true;
+  private hoverEnabled = false;
 
   /**
    * ARCHITECTURE SCAFFOLD:
@@ -105,12 +115,22 @@ export class TouchController {
    * same-surface contact can claim before one-contact candidate logic. This is
    * an explicit list, not an extensible gesture plugin registry.
    */
-  private readonly recognizers: readonly TouchRecognizer[];
+  private readonly recognizers: readonly RecognizerRegistration[];
 
   constructor(private readonly options: TouchControllerOptions) {
     this.recognizers = [
-      new PinchRecognizer(options.plotly),
-      new DoubleTapDragRecognizer(options.plotly),
+      {
+        recognizer: new PinchRecognizer(options.plotly),
+        enabled: () => this.zoomEnabled,
+      },
+      {
+        recognizer: new DoubleTapDragRecognizer(options.plotly),
+        enabled: () => this.zoomEnabled,
+      },
+      {
+        recognizer: new LongPressRecognizer(options.plotly),
+        enabled: () => this.hoverEnabled,
+      },
     ];
   }
 
@@ -134,17 +154,32 @@ export class TouchController {
    * Disable native Plotly touch behavior or mutate adapter internals.
    *
    * Implementation:
-   * The existing configuration naming is retained; Scan remains out of scope
-   * and must not be folded into this boolean.
+   * The existing configuration naming is retained. This gate controls custom
+   * zoom only; long-press hover has its independent `touchHoverEnabled` gate.
    */
   get isEnabled(): boolean {
-    return this.enabled;
+    return this.zoomEnabled;
   }
 
   set isEnabled(value: boolean) {
-    if (this.enabled === value) return;
-    this.enabled = value;
-    if (!value) this.cancelOwner();
+    if (this.zoomEnabled === value) return;
+    this.zoomEnabled = value;
+    if (!value && this.owner?.changesViewport) this.cancelOwner();
+    this.resetRecognizers();
+  }
+
+  /** Enable long-press hover independently from custom zoom recognition. */
+  get touchHoverEnabled(): boolean {
+    return this.hoverEnabled;
+  }
+
+  set touchHoverEnabled(value: boolean) {
+    if (this.hoverEnabled === value) return;
+    this.hoverEnabled = value;
+    if (!value) {
+      if (this.owner && !this.owner.changesViewport) this.cancelOwner();
+      this.options.plotly.clearHover();
+    }
     this.resetRecognizers();
   }
 
@@ -239,21 +274,55 @@ export class TouchController {
    * This routing should remain unchanged as gesture logic is implemented.
    */
   private readonly onTouchEvent = (event: TouchEvent): void => {
-    if (!this.enabled) return;
+    if (this.hoverEnabled) {
+      if (event.type === "touchstart" && event.touches.length === 1) {
+        this.options.plotly.clearHover();
+      }
+      if (
+        event.isTrusted &&
+        (event.type === "touchend" || event.type === "touchcancel") &&
+        event.touches.length === 0
+      ) {
+        this.options.plotly.preserveHoverThroughNativeTouchEnd(
+          Boolean(this.owner && !this.owner.changesViewport),
+        );
+      }
+    }
+
+    if (!this.zoomEnabled && !this.hoverEnabled) return;
     if (this.owner) {
       this.applySessionResult(this.owner.handle(event));
       return;
     }
 
-    for (const recognizer of this.recognizers) {
-      const session = recognizer.handle(event);
-      if (!session) continue;
-      this.owner = session;
-      this.resetRecognizers();
-      this.options.onGestureStart();
-      this.applySessionResult(session.handle(event));
-      return;
+    for (const registration of this.recognizers) {
+      if (!registration.enabled()) continue;
+      registration.recognizer.handle(event, (session) =>
+        registration.enabled() ? this.claim(session) : false,
+      );
+      // A retained callback may mutate `owner` inside `handle`; TypeScript's
+      // local control-flow analysis cannot see that callback side effect.
+      const claimedOwner = this.owner as TouchSession | undefined;
+      if (claimedOwner) {
+        this.applySessionResult(claimedOwner.handle(event));
+        return;
+      }
     }
+  };
+
+  /**
+   * Accept the first synchronous or timer-driven recognizer claim.
+   *
+   * JavaScript task serialization makes owner installation atomic. Recognizer
+   * reset is the stale-capability boundary: timer-based recognizers must clear
+   * and invalidate their own callbacks during this reset.
+   */
+  private readonly claim: ClaimTouch = (session) => {
+    if ((!this.zoomEnabled && !this.hoverEnabled) || this.owner) return false;
+    this.owner = session;
+    this.resetRecognizers();
+    if (session.changesViewport) this.options.onGestureStart();
+    return true;
   };
 
   /**
@@ -282,12 +351,18 @@ export class TouchController {
   private applySessionResult(result: TouchSessionResult): void {
     if (result === undefined) return;
     if (result) {
+      const previousChangesViewport = this.owner?.changesViewport;
       this.owner = result;
+      if (previousChangesViewport !== result.changesViewport) {
+        if (previousChangesViewport) this.options.onGestureEnd();
+        if (result.changesViewport) this.options.onGestureStart();
+      }
       return;
     }
+    const changedViewport = this.owner?.changesViewport;
     this.owner = undefined;
     this.resetRecognizers();
-    this.options.onGestureEnd();
+    if (changedViewport) this.options.onGestureEnd();
   }
 
   /**
@@ -316,7 +391,7 @@ export class TouchController {
     const owner = this.owner;
     this.owner = undefined;
     owner.cancel();
-    this.options.onGestureEnd();
+    if (owner.changesViewport) this.options.onGestureEnd();
   }
 
   /**
@@ -342,6 +417,6 @@ export class TouchController {
    * Remain unconditional so no candidate leaks across ownership boundaries.
    */
   private resetRecognizers(): void {
-    for (const recognizer of this.recognizers) recognizer.reset();
+    for (const { recognizer } of this.recognizers) recognizer.reset();
   }
 }
