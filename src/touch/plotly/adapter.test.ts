@@ -184,7 +184,7 @@ describe("PlotlyTouchAdapter native observation", () => {
     expect(fx.unhover).toHaveBeenLastCalledWith(root);
   });
 
-  it("reconciles native completion without overwriting newer hover state", () => {
+  it("clears native completion without overwriting newer custom hover", () => {
     const { adapter, child, root, touch } = makeFixture();
     const surface = adapter.resolveSurface(touch(child)) as PlotlyTouchSurface;
     const fx = (
@@ -198,21 +198,25 @@ describe("PlotlyTouchAdapter native observation", () => {
       return callbacks.length;
     };
 
+    adapter.reconcileNativeTouchEnd();
+    expect(callbacks).toHaveLength(1);
     adapter.showHover(surface, { clientX: 45, clientY: 67 });
     fx.hover.mockClear();
-    adapter.preserveHoverThroughNativeTouchEnd(true);
-    callbacks.shift()?.(0);
-    expect(fx.unhover).toHaveBeenCalledTimes(1);
-    expect(fx.hover).toHaveBeenCalledTimes(1);
-
-    fx.hover.mockClear();
-    fx.unhover.mockClear();
-    adapter.preserveHoverThroughNativeTouchEnd(true);
-    adapter.clearHover();
-    fx.unhover.mockClear();
     callbacks.shift()?.(0);
     expect(fx.unhover).not.toHaveBeenCalled();
     expect(fx.hover).not.toHaveBeenCalled();
+
+    fx.unhover.mockClear();
+    adapter.reconcileNativeTouchEnd();
+    expect(callbacks).toHaveLength(0);
+    expect(fx.unhover).not.toHaveBeenCalled();
+
+    adapter.clearHover();
+    fx.unhover.mockClear();
+    adapter.reconcileNativeTouchEnd();
+    expect(callbacks).toHaveLength(1);
+    callbacks.shift()?.(0);
+    expect(fx.unhover).toHaveBeenCalledTimes(1);
   });
 
   it("shares one canonical record until its final lease is released", () => {

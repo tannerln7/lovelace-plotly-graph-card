@@ -456,7 +456,7 @@ try {
           paused = value;
         },
       });
-      card.plot = async (options) => plotCalls.push(options);
+      const productionPlot = card.plot;
 
       const controllerListener = card.touchController.onTouchEvent;
       const activeControllerListeners = new Set();
@@ -478,16 +478,23 @@ try {
         entities: [],
         disable_pinch_to_zoom: true,
       });
+      card.hass = {
+        states: {},
+        locale: { language: "en", first_weekday: "language" },
+      };
       document.body.append(card);
-      await new Promise(requestAnimationFrame);
+      await productionPlot({ should_fetch: true });
       const firstConnectionCount = activeControllerListeners.size;
+      card.plot = async (options) => {
+        if (!card.pausedRendering) plotCalls.push(options);
+      };
       card.remove();
       const disconnectedCount = activeControllerListeners.size;
       document.body.append(card);
       await new Promise(requestAnimationFrame);
       const reconnectedCount = activeControllerListeners.size;
 
-      await TouchPinchTest.Plotly.newPlot(
+      await TouchPinchTest.Plotly.react(
         card.contentEl,
         [{ x: [0, 25, 50, 75, 100], y: [0, 25, 50, 75, 100] }],
         {
@@ -508,6 +515,7 @@ try {
         activeControllerListeners,
         card,
         plotCalls,
+        productionPlot,
         transitions,
       };
       return {
@@ -565,11 +573,19 @@ try {
 
     await page.waitForTimeout(350);
     await page.evaluate(async () => {
+      productionTouchFixture.card.plot =
+        productionTouchFixture.productionPlot;
       await productionTouchFixture.card.setConfig({
         type: "custom:plotly-graph",
         entities: [],
         disable_pinch_to_zoom: false,
       });
+      await productionTouchFixture.productionPlot({ should_fetch: false });
+      productionTouchFixture.card.plot = async (options) => {
+        if (!productionTouchFixture.card.pausedRendering)
+          productionTouchFixture.plotCalls.push(options);
+      };
+      await new Promise((resolve) => setTimeout(resolve, 100));
       productionTouchFixture.plotCalls.length = 0;
       productionTouchFixture.transitions.length = 0;
     });
@@ -611,7 +627,9 @@ try {
     assert.deepEqual(state, {
       activeListeners: 4,
       paused: false,
-      plots: [{ should_fetch: true }],
+      // One request comes from Plotly's relayout listener and one from the
+      // custom-gesture lifecycle. The production debounce coalesces them.
+      plots: [{ should_fetch: true }, { should_fetch: true }],
       transitions: [true, false],
     });
 

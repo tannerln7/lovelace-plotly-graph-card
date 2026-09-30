@@ -63,7 +63,7 @@ const adapter = (takeover = true) => {
     zoom: jest.fn(),
     showHover: jest.fn(),
     clearHover: jest.fn(),
-    preserveHoverThroughNativeTouchEnd: jest.fn(),
+    reconcileNativeTouchEnd: jest.fn(),
     cleanupCancelledGesture: jest.fn(),
     releaseNativeObservation: jest.fn(),
   };

@@ -380,29 +380,25 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
   /** Clear both rendered hover and Plotly's throttled pending hover callback. */
   clearHover(): void {
     this.latestCustomHover = undefined;
-    plotlyFx.unhover(this.root);
+    if (this.root._fullLayout) plotlyFx.unhover(this.root);
   }
 
   /**
    * Let Plotly finish native click/double-click bookkeeping first, then remove
-   * native tap hover or restore the custom long-press hover before the next
-   * paint. A microtask is too early in Shadow DOM: it can run before Plotly's
-   * document-level touchend closure. The wrapped `Fx.unhover` call also
-   * cancels Plotly's queued hover throttle.
+   * native tap hover before the next paint. Custom takeover makes Plotly's
+   * touchend closure return early, so an existing custom hover needs no
+   * unhover/re-render cycle. A microtask is too early in Shadow DOM because it
+   * can run before Plotly's document-level touchend closure.
    */
-  preserveHoverThroughNativeTouchEnd(preserveCurrent: boolean): void {
-    const preserved = preserveCurrent ? this.latestCustomHover : undefined;
-    const afterNativeCompletion = (): void => {
-      // A later sequence may have cleared or replaced this request while the
-      // browser was waiting to run the frame callback. Never let stale
-      // completion work erase that newer state.
-      if (preserved) {
-        if (this.latestCustomHover !== preserved) return;
-      } else if (this.latestCustomHover) return;
+  reconcileNativeTouchEnd(): void {
+    if (this.latestCustomHover) return;
 
-      plotlyFx.unhover(this.root);
-      if (preserved) this.renderHover(preserved);
-      else this.latestCustomHover = undefined;
+    const afterNativeCompletion = (): void => {
+      // Never let deferred cleanup for an older native sequence erase a newer
+      // custom hover.
+      if (this.latestCustomHover) return;
+
+      if (this.root._fullLayout) plotlyFx.unhover(this.root);
     };
     const view = this.root.ownerDocument.defaultView;
     if (view?.requestAnimationFrame)

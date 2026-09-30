@@ -57,7 +57,6 @@ const defaultYamlRequired = {
   raw_plotly_config: false,
   ha_theme: true,
   disable_pinch_to_zoom: false,
-  touch_hover: false,
   raw_plotly: false,
   defaults: {
     entity: {},
@@ -206,6 +205,7 @@ export function addPreParsingDefaults(
     {
       layout: yaml.ha_theme ? getThemedLayout(css_vars) : {},
     },
+    { touch_hover: false },
     yaml.raw_plotly_config ? {} : defaultYamlOptional,
     preset,
     yaml

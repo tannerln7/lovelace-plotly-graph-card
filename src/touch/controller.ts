@@ -164,7 +164,7 @@ export class TouchController {
   set isEnabled(value: boolean) {
     if (this.zoomEnabled === value) return;
     this.zoomEnabled = value;
-    if (!value && this.owner?.changesViewport) this.cancelOwner();
+    this.cancelOwner();
     this.resetRecognizers();
   }
 
@@ -176,10 +176,8 @@ export class TouchController {
   set touchHoverEnabled(value: boolean) {
     if (this.hoverEnabled === value) return;
     this.hoverEnabled = value;
-    if (!value) {
-      if (this.owner && !this.owner.changesViewport) this.cancelOwner();
-      this.options.plotly.clearHover();
-    }
+    this.cancelOwner();
+    if (!value) this.options.plotly.clearHover();
     this.resetRecognizers();
   }
 
@@ -248,6 +246,7 @@ export class TouchController {
     }
     this.cancelOwner();
     this.resetRecognizers();
+    this.options.plotly.clearHover();
   }
 
   /**
@@ -280,12 +279,10 @@ export class TouchController {
       }
       if (
         event.isTrusted &&
-        (event.type === "touchend" || event.type === "touchcancel") &&
+        event.type === "touchend" &&
         event.touches.length === 0
       ) {
-        this.options.plotly.preserveHoverThroughNativeTouchEnd(
-          Boolean(this.owner && !this.owner.changesViewport),
-        );
+        this.options.plotly.reconcileNativeTouchEnd();
       }
     }
 

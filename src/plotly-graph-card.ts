@@ -372,9 +372,6 @@ export class PlotlyGraph extends HTMLElement {
   async setConfig(config: InputConfig) {
     const was = this.config;
     this.config = config;
-    const is = this.config;
-    this.touchController.isEnabled = !is.disable_pinch_to_zoom;
-    this.touchController.touchHoverEnabled = Boolean(is.touch_hover);
     this.exitBrowsingMode();
   }
   getCSSVars() {
@@ -453,6 +450,10 @@ export class PlotlyGraph extends HTMLElement {
       .map((e) => "<span>" + (e || "See devtools console") + "</span>")
       .join("\n<br />\n");
     this.parsed_config = parsed;
+    this.touchController.isEnabled =
+      !this.parsed_config.disable_pinch_to_zoom;
+    this.touchController.touchHoverEnabled =
+      this.parsed_config.touch_hover ?? false;
 
     const {
       entities,

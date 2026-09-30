@@ -32,9 +32,8 @@ import { OwnedTouchSession } from "./owned";
  * clear hover on normal release, or transfer unsupported extra contacts.
  *
  * Implementation:
- * Any unsupported contact shape enters sticky draining. The controller's
- * generic final-touch bookend asks the adapter to restore this custom hover
- * after Plotly's native completion path has run.
+ * Any unsupported contact shape enters sticky draining. Normal release leaves
+ * the custom hover rendered; cancellation explicitly clears it.
  */
 export class HoverSession extends OwnedTouchSession {
   readonly changesViewport = false;
@@ -53,6 +52,17 @@ export class HoverSession extends OwnedTouchSession {
   /** Called only after the controller has accepted the timer-driven claim. */
   activate(): void {
     this.plotly.showHover(this.contact.surface, this.current);
+  }
+
+  handle(event: TouchEvent): TouchSessionResult {
+    if (event.type !== "touchcancel" || event.touches.length !== 0)
+      return super.handle(event);
+
+    try {
+      return super.handle(event);
+    } finally {
+      this.plotly.clearHover();
+    }
   }
 
   protected handleOwnedEvent(event: TouchEvent): TouchSessionResult {

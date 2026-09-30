@@ -38,7 +38,7 @@ const adapter = () => {
     zoom: jest.fn(),
     showHover: jest.fn(),
     clearHover: jest.fn(),
-    preserveHoverThroughNativeTouchEnd: jest.fn(),
+    reconcileNativeTouchEnd: jest.fn(),
     cleanupCancelledGesture: jest.fn(),
     releaseNativeObservation: jest.fn(),
   };
@@ -164,6 +164,7 @@ describe("HoverSession", () => {
       observation,
       cancellation,
     );
+    expect(plotly.clearHover).toHaveBeenCalledTimes(1);
     expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(1);
   });
 });

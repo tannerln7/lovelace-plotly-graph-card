@@ -214,11 +214,11 @@ export interface PlotlyTouchAdapterContract {
   clearHover(): void;
 
   /**
-   * Reconcile hover after Plotly's native final touch completion has run.
-   * `true` restores the adapter's latest custom hover; `false` clears native
-   * tap hover. The adapter owns the Plotly-version-specific scheduling.
+   * Remove hover produced by an unclaimed native touch completion after
+   * Plotly has finished its click bookkeeping. Existing custom hover is left
+   * untouched.
    */
-  preserveHoverThroughNativeTouchEnd(preserveCurrent: boolean): void;
+  reconcileNativeTouchEnd(): void;
 
   /**
    * ARCHITECTURE SCAFFOLD:

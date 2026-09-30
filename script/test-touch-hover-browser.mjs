@@ -82,9 +82,10 @@ try {
         const events = { clicks: 0, doubles: 0, starts: 0, ends: 0 };
         gd.on("plotly_click", () => (events.clicks += 1));
         gd.on("plotly_doubleclick", () => (events.doubles += 1));
+        const adapter = new TouchHoverTest.PlotlyTouchAdapter(gd);
         const controller = new TouchHoverTest.TouchController({
           root: gd,
-          plotly: new TouchHoverTest.PlotlyTouchAdapter(gd),
+          plotly: adapter,
           onGestureStart: () => (events.starts += 1),
           onGestureEnd: () => (events.ends += 1),
         });
@@ -96,7 +97,7 @@ try {
         const marker = gd.querySelectorAll(".scatterlayer .point")[2];
         const draggerRect = dragger.getBoundingClientRect();
         const markerRect = marker.getBoundingClientRect();
-        window.hoverFixture = { controller, events, gd };
+        window.hoverFixture = { adapter, controller, events, gd };
         return {
           dragger: {
             left: draggerRect.left,
@@ -128,7 +129,7 @@ try {
     };
     const snapshot = () =>
       page.evaluate(() => {
-        const { events, gd } = window.hoverFixture;
+        const { adapter, events, gd } = window.hoverFixture;
         return {
           events: {
             clicks: events.clicks,
@@ -142,6 +143,11 @@ try {
           range: [...gd._fullLayout.xaxis.range],
           dragging: Boolean(gd._dragging),
           dragged: Boolean(gd._dragged),
+          dragdata: Boolean(gd._dragdata),
+          observations: [...adapter.observations.values()].reduce(
+            (count, records) => count + records.size,
+            0,
+          ),
         };
       });
     return { cdp, errors, page, point, send, setup, snapshot };
@@ -229,6 +235,51 @@ try {
     state = await f.snapshot();
     assert.equal(state.hoverCount, 0, "next sequence must clear prior hover");
     await f.send("touchEnd", []);
+    assert.deepEqual(f.errors, []);
+    await f.page.close();
+  }
+
+  // A claimed hover is cancelled, not persisted, by a real zero-contact
+  // touchcancel. The observation and Plotly native drag bookkeeping drain too.
+  {
+    const f = await fixture();
+    const p = f.point(19, f.setup.marker.x, f.setup.marker.y);
+    await f.send("touchStart", [p]);
+    await f.page.waitForTimeout(330);
+    assert((await f.snapshot()).hoverCount > 0);
+    await f.send("touchCancel", []);
+    await f.page.waitForTimeout(100);
+    const state = await f.snapshot();
+    assert.equal(state.hoverCount, 0);
+    assert.equal(state.hoverChildren, 0);
+    assert.equal(state.observations, 0);
+    assert.equal(state.dragging, false);
+    assert.equal(state.dragged, false);
+    assert.equal(state.dragdata, false);
+    assert.deepEqual(f.errors, []);
+    await f.page.close();
+  }
+
+  // Controller teardown clears both an actively owned hover and a hover that
+  // a completed session intentionally left visible.
+  {
+    const f = await fixture();
+    const p = f.point(20, f.setup.marker.x, f.setup.marker.y);
+    await f.send("touchStart", [p]);
+    await f.page.waitForTimeout(330);
+    assert((await f.snapshot()).hoverCount > 0);
+    await f.page.evaluate(() => hoverFixture.controller.disconnect());
+    assert.equal((await f.snapshot()).hoverCount, 0);
+    await f.send("touchEnd", []);
+
+    await f.page.evaluate(() => hoverFixture.controller.connect());
+    await f.send("touchStart", [f.point(21, p.x, p.y)]);
+    await f.page.waitForTimeout(330);
+    await f.send("touchEnd", []);
+    await f.page.waitForTimeout(80);
+    assert((await f.snapshot()).hoverCount > 0);
+    await f.page.evaluate(() => hoverFixture.controller.disconnect());
+    assert.equal((await f.snapshot()).hoverCount, 0);
     assert.deepEqual(f.errors, []);
     await f.page.close();
   }
@@ -404,15 +455,23 @@ try {
           paused = value;
         },
       });
-      card.plot = async (options) => plotCalls.push(options);
       await card.setConfig({
         type: "custom:plotly-graph",
         entities: [],
         disable_pinch_to_zoom: true,
         touch_hover: true,
       });
+      card.hass = {
+        states: {},
+        locale: { language: "en", first_weekday: "language" },
+      };
       document.body.append(card);
-      await TouchHoverTest.Plotly.newPlot(
+      for (let i = 0; !card.parsed_config && i < 100; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      if (!card.parsed_config) throw new Error("card config was not parsed");
+      card.plot = async (options) => plotCalls.push(options);
+      await TouchHoverTest.Plotly.react(
         card.contentEl,
         [
           {
