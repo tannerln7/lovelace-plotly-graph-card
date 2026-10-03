@@ -4,9 +4,12 @@ import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
   PlotlyTouchSurface,
-} from "./plotly/contracts";
-import { LONG_PRESS_MS, LongPressRecognizer } from "./recognizers/long-press";
-import { HoverSession } from "./sessions/hover";
+} from "./plotly/adapter";
+import {
+  HoverSession,
+  LONG_PRESS_MS,
+  LongPressRecognizer,
+} from "./gestures/long-press";
 
 const surface = {} as PlotlyTouchSurface;
 const observation = {} as NativeGestureObservation;
@@ -118,28 +121,21 @@ describe("LongPressRecognizer", () => {
 
 describe("HoverSession", () => {
   const makeSession = (plotly: jest.Mocked<PlotlyTouchAdapterContract>) =>
-    new HoverSession(
-      plotly,
-      observation,
-      {
-        identifier: 7,
-        surface,
-        start: { clientX: 10, clientY: 20 },
-      },
-      { clientX: 10, clientY: 20 },
-    );
+    new HoverSession(plotly, observation, {
+      identifier: 7,
+      surface,
+      start: { clientX: 10, clientY: 20 },
+    });
 
   it("activates, scrubs by identifier, and preserves hover on release", () => {
     const plotly = adapter();
     const session = makeSession(plotly);
-    session.activate();
+    session.activate({ clientX: 10, clientY: 20 });
 
-    const move = event("touchmove", [touch(7, 30, 40)]);
+    const movedTouch = touch(7, 30, 40);
+    const move = event("touchmove", [movedTouch]);
     expect(session.handle(move)).toBeUndefined();
-    expect(plotly.showHover).toHaveBeenLastCalledWith(surface, {
-      clientX: 30,
-      clientY: 40,
-    });
+    expect(plotly.showHover).toHaveBeenLastCalledWith(surface, movedTouch);
     expect(move.preventDefault).toHaveBeenCalled();
 
     expect(session.handle(event("touchend", []))).toBeNull();

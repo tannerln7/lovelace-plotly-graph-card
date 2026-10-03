@@ -144,10 +144,7 @@ try {
           dragging: Boolean(gd._dragging),
           dragged: Boolean(gd._dragged),
           dragdata: Boolean(gd._dragdata),
-          observations: [...adapter.observations.values()].reduce(
-            (count, records) => count + records.size,
-            0,
-          ),
+          observations: adapter.activeObservation ? 1 : 0,
         };
       });
     return { cdp, errors, page, point, send, setup, snapshot };

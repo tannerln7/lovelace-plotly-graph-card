@@ -2,40 +2,8 @@ import type { TouchSession, TouchSessionResult } from "../contracts";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
-} from "../plotly/contracts";
+} from "../plotly/adapter";
 
-/**
- * ARCHITECTURE SCAFFOLD:
- *
- * Purpose:
- * Centralize the lifecycle that every recognized touch session shares without
- * turning gesture recognition or effects into a generic gesture framework.
- *
- * Responsibility:
- * Keep custom ownership sticky while contacts drain, suppress owned starts and
- * moves, let physical touchend reach Plotly's native cleanup, perform only the
- * researched zero-contact cancellation cleanup, and release or transfer one
- * native-observation lease exactly once.
- *
- * Interactions:
- * Concrete sessions implement only active gesture events. `TouchController`
- * sees the normal `TouchSession` contract; `PlotlyTouchAdapter` remains the
- * sole owner of Plotly-specific cleanup mechanics.
- *
- * Owns:
- * Shared drain, cancellation reentrancy, native-cleanup, and lease-ownership
- * state. Concrete sessions own contact identity and gesture-specific deltas.
- *
- * Must not:
- * Recognize a gesture, inspect Plotly state, calculate zoom, decide transfer
- * validity, suppress physical touchend, or synthesize cancellation cleanup for
- * controller disable/disconnect.
- *
- * Implementation:
- * `undefined` preserves ownership, `null` ends it, and a returned session
- * transfers ownership directly. A transferring session explicitly relinquishes
- * its lease without releasing it after constructing the replacement owner.
- */
 export abstract class OwnedTouchSession implements TouchSession {
   abstract readonly changesViewport: boolean;
   protected draining = false;
@@ -54,8 +22,8 @@ export abstract class OwnedTouchSession implements TouchSession {
     if (event.type === "touchcancel") return this.handleCancel(event);
 
     this.suppress(event);
-    if (this.draining) return undefined;
-    return this.handleOwnedEvent(event);
+    if (!this.draining) return this.handleOwnedEvent(event);
+    return undefined;
   }
 
   cancel(): void {
@@ -69,7 +37,7 @@ export abstract class OwnedTouchSession implements TouchSession {
   }
 
   private handleEnd(event: TouchEvent): TouchSessionResult {
-    // Plotly's document touchend closure must receive physical completion.
+    // Plotly's document touchend must run to remove its native listeners.
     this.nativeCleanupPending = false;
     if (event.touches.length > 0) {
       this.draining = true;

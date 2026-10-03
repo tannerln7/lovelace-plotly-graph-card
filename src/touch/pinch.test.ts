@@ -3,9 +3,8 @@ import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
   PlotlyTouchSurface,
-} from "./plotly/contracts";
-import { PinchRecognizer } from "./recognizers/pinch";
-import { PinchSession } from "./sessions/pinch";
+} from "./plotly/adapter";
+import { PinchRecognizer, PinchSession } from "./gestures/pinch";
 
 const surface = {} as PlotlyTouchSurface;
 const observation = {} as NativeGestureObservation;
@@ -252,8 +251,7 @@ describe("PinchSession", () => {
           start: { clientX: 10, clientY: 0 },
         },
       ],
-      { clientX: 5, clientY: 0 },
-      10,
+      [touch(1, 0, 0), touch(2, 10, 0)],
     );
 
   it("tracks identifiers, keeps a fixed anchor, and drains after partial release", () => {

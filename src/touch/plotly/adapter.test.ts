@@ -6,9 +6,12 @@ jest.mock("../../plotly", () => ({
   },
 }));
 
-import { PlotlyTouchAdapter } from "./adapter";
+import {
+  PlotlyTouchAdapter,
+  type NativeGestureObservation,
+  type PlotlyTouchSurface,
+} from "./adapter";
 import Plotly from "../../plotly";
-import type { NativeGestureObservation, PlotlyTouchSurface } from "./contracts";
 
 type RelayoutListener = (update: Plotly.PlotRelayoutEvent) => void;
 
@@ -149,6 +152,12 @@ describe("PlotlyTouchAdapter native observation", () => {
     const foreignRoot = new FakePlotRoot();
     const foreignDragger = new FakeElement(["nsewdrag", "drag"], foreignRoot);
     expect(adapter.resolveSurface(touch(foreignDragger))).toBeUndefined();
+    expect(() =>
+      adapter.acquireNativeObservation(
+        foreignDragger as unknown as PlotlyTouchSurface,
+        1,
+      ),
+    ).toThrow("does not belong to this adapter");
   });
 
   it("routes hover through the exact surface and clears Plotly hover state", () => {

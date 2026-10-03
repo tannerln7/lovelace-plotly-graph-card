@@ -3,10 +3,12 @@ import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
   PlotlyTouchSurface,
-} from "./plotly/contracts";
-import { DoubleTapDragRecognizer } from "./recognizers/double-tap-drag";
-import { DragZoomSession } from "./sessions/drag-zoom";
-import { PinchSession } from "./sessions/pinch";
+} from "./plotly/adapter";
+import {
+  DoubleTapDragRecognizer,
+  DragZoomSession,
+} from "./gestures/double-tap-drag";
+import { PinchSession } from "./gestures/pinch";
 
 const surface = {} as PlotlyTouchSurface;
 const otherSurface = {} as PlotlyTouchSurface;

@@ -1,18 +1,71 @@
 import type {
   ClaimTouch,
+  ClientPoint,
   TouchContactIdentity,
   TouchRecognizer,
+  TouchSessionResult,
 } from "../contracts";
-import { findTouch, touchContact, touchPoint } from "../geometry";
-import type { ClientPoint } from "../geometry";
+import {
+  findTouch,
+  pointMovement,
+  touchContact,
+  touchPoint,
+} from "../contracts";
 import type {
   NativeGestureObservation,
   PlotlyTouchAdapterContract,
-} from "../plotly/contracts";
-import { HoverSession } from "../sessions/hover";
+} from "../plotly/adapter";
+import { OwnedTouchSession } from "./owned";
 
 export const LONG_PRESS_MS = 300;
 const MOVEMENT_TOLERANCE_PX = 8;
+
+export class HoverSession extends OwnedTouchSession {
+  readonly changesViewport = false;
+
+  constructor(
+    plotly: PlotlyTouchAdapterContract,
+    observation: NativeGestureObservation,
+    private readonly contact: TouchContactIdentity,
+  ) {
+    super(plotly, observation);
+  }
+
+  activate(point: ClientPoint): void {
+    this.plotly.showHover(this.contact.surface, point);
+  }
+
+  handle(event: TouchEvent): TouchSessionResult {
+    if (event.type !== "touchcancel" || event.touches.length) {
+      return super.handle(event);
+    }
+    try {
+      return super.handle(event);
+    } finally {
+      this.plotly.clearHover();
+    }
+  }
+
+  cancel(): void {
+    try {
+      super.cancel();
+    } finally {
+      this.plotly.clearHover();
+    }
+  }
+
+  protected handleOwnedEvent(event: TouchEvent): TouchSessionResult {
+    const touch = findTouch(event.touches, this.contact.identifier);
+    if (event.touches.length !== 1 || !touch) {
+      this.draining = true;
+      return undefined;
+    }
+    if (event.type === "touchmove") {
+      this.plotly.showHover(this.contact.surface, touch);
+    }
+    return undefined;
+  }
+}
 
 interface LongPressCandidate {
   readonly contact: TouchContactIdentity;
@@ -22,35 +75,6 @@ interface LongPressCandidate {
   timer?: ReturnType<typeof setTimeout>;
 }
 
-/**
- * ARCHITECTURE SCAFFOLD:
- *
- * Purpose:
- * Recognize stationary elapsed-time touch hover without asking the controller
- * to schedule or poll recognition.
- *
- * Responsibility:
- * Observe one eligible native contact, cancel on movement/shape changes, and
- * retain the controller's claim capability until the 300 ms timeout expires.
- *
- * Interactions:
- * The first contact remains entirely native while pending. On timeout this
- * recognizer performs the same atomic adapter takeover used by zoom gestures,
- * transfers its observation lease, and claims one initialized HoverSession.
- *
- * Owns:
- * One contact identity, current point, timer, opaque observation lease, and
- * the claim capability supplied for that exact candidate.
- *
- * Must not:
- * Suppress pending events, schedule through the controller, inspect Plotly
- * state, scrub hover after claim, or survive reset with a live timer/resource.
- *
- * Implementation:
- * Candidate identity plus timer cancellation is the stale-claim boundary.
- * JavaScript task serialization makes takeover and claim atomic with respect
- * to other recognizers; a rejected claim cancels the constructed session.
- */
 export class LongPressRecognizer implements TouchRecognizer {
   private candidate?: LongPressCandidate;
 
@@ -73,10 +97,8 @@ export class LongPressRecognizer implements TouchRecognizer {
     if (
       event.touches.length !== 1 ||
       !touch ||
-      Math.max(
-        Math.abs(touch.clientX - this.candidate.contact.start.clientX),
-        Math.abs(touch.clientY - this.candidate.contact.start.clientY),
-      ) >= MOVEMENT_TOLERANCE_PX
+      pointMovement(touch, this.candidate.contact.start) >=
+        MOVEMENT_TOLERANCE_PX
     ) {
       this.reset();
       return;
@@ -123,11 +145,9 @@ export class LongPressRecognizer implements TouchRecognizer {
       this.plotly,
       candidate.observation,
       candidate.contact,
-      candidate.current,
     );
     this.candidate = undefined;
-    if (candidate.timer !== undefined) clearTimeout(candidate.timer);
-    if (candidate.claim(session)) session.activate();
+    if (candidate.claim(session)) session.activate(candidate.current);
     else session.cancel();
   }
 }
