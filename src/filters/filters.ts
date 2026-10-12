@@ -7,6 +7,9 @@ import {
 } from "../duration/duration";
 import { StatisticValue } from "../recorder-types";
 import { HassEntity, YValue } from "../types";
+import { inTimeZone } from "../timezone";
+import { startOfDay } from "date-fns";
+import { calendarInterval } from "../duration/calendar";
 
 import BaseRegression from "ml-regression-base";
 import LinearRegression from "ml-regression-simple-linear";
@@ -16,18 +19,27 @@ import ExponentialRegression from "ml-regression-exponential";
 import TheilSenRegression from "ml-regression-theil-sen";
 import { RobustPolynomialRegression } from "ml-regression-robust-polynomial";
 import FFTRegression from "./fft-regression";
+import { minMaxIndices } from "./min-max";
 
 const castFloat = (y: any) => parseFloat(y);
+// `+date` is much slower than getTime() in V8
+const ms = (x: any): number => (x instanceof Date ? x.getTime() : +x);
+// `vars.aligned` objects created by align_timestamps, so a stored var with
+// the same name is never silently replaced.
+const alignedVars = new WeakSet<object>();
 const myEval = typeof window != "undefined" ? window.eval : global.eval;
 
 type FilterData = {
-  xs: Date[];
+  xs: (Date | number)[];
   ys: YValue[];
   states: HassEntity[];
   statistics: StatisticValue[];
   meta: HassEntity["attributes"];
   vars: Record<any, any>;
   hass: HomeAssistant;
+  /** IANA timezone the plot is drawn in, undefined for the browser's */
+  timeZone?: string;
+  get?: (path: string) => unknown;
 };
 export type FilterFn = (p: FilterData) => Partial<FilterData>;
 
@@ -79,6 +91,17 @@ const force_numeric: (p: FilterData) => { ys: number[] } & FilterData = ({
 
 const filters = {
   force_numeric: () => force_numeric,
+  min_max:
+    (max_points: number = 1000): FilterFn =>
+    ({ xs, ys, states, statistics, get }) => {
+      const indices = minMaxIndices(xs, ys, max_points, get?.("visible_range"));
+      return {
+        xs: indices.map((i) => xs[i]),
+        ys: indices.map((i) => ys[i]),
+        states: states.length ? indices.map((i) => states[i]) : [],
+        statistics: statistics.length ? indices.map((i) => statistics[i]) : [],
+      };
+    },
   add:
     (val: number) =>
     ({ ys }) => ({
@@ -138,7 +161,7 @@ const filters = {
     (unit: keyof typeof timeUnits = "h") =>
     ({ xs, ys, meta }) => {
       const last = {
-        x: +xs[0],
+        x: ms(xs[0]),
         y: NaN,
       };
       checkTimeUnits(unit);
@@ -150,7 +173,7 @@ const filters = {
         },
         xs,
         ys: mapNumbers(ys, (y, i) => {
-          const x = +xs[i];
+          const x = ms(xs[i]);
           const dateDelta = (x - last.x) / timeUnits[unit];
           const yDeriv = (y - last.y) / dateDelta;
           last.y = y;
@@ -174,14 +197,24 @@ const filters = {
     const reset_every = parseTimeDuration(param.reset_every ?? "0s");
     const offset = parseTimeDuration(param.offset ?? "0s");
     checkTimeUnits(unit);
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    const t0 = +date + offset;
-    return ({ xs, ys, meta }) => {
+    return ({ xs, ys, meta, timeZone }) => {
+      const calendar = calendarInterval(param.reset_every ?? "0s", timeZone);
+      const t0 = +startOfDay(Date.now(), inTimeZone(timeZone)) + offset;
+      let start = NaN,
+        end = NaN;
+      const resetAt = (x: number) => {
+        if (!calendar)
+          return t0 + Math.floor((x - t0) / reset_every) * reset_every;
+        if (!(x >= start && x < end)) {
+          start = calendar.floor(x - offset) + offset;
+          end = calendar.next(start - offset) + offset;
+        }
+        return start;
+      };
       let yAcc = 0;
       let last = {
         x: NaN,
-        laps: 0,
+        reset: NaN,
         y: 0,
       };
       return {
@@ -191,15 +224,15 @@ const filters = {
         },
         xs: xs,
         ys: mapNumbers(ys, (y, i) => {
-          const x = +xs[i];
+          const x = ms(xs[i]);
           let intervalStart = last.x;
           if (reset_every > 0) {
-            const laps = Math.floor((x - t0) / reset_every);
-            if (laps !== last.laps) {
+            const reset = resetAt(x);
+            if (reset !== last.reset) {
               yAcc = 0;
-              last.laps = laps;
+              last.reset = reset;
               // only the part after the reset belongs to the new period
-              intervalStart = Math.max(intervalStart, t0 + laps * reset_every);
+              intervalStart = Math.max(intervalStart, reset);
             }
           }
           const dateDelta = (x - intervalStart) / timeUnits[unit];
@@ -225,7 +258,7 @@ const filters = {
     (params) => {
       const { xs, ys, ...rest } = force_numeric(params);
       const ys2: number[] = [];
-      const xs2: Date[] = [];
+      const xs2: FilterData["xs"] = [];
       let acc = {
         y: 0,
         count: 0,
@@ -233,12 +266,12 @@ const filters = {
       };
       for (let i = 0; i < ys.length + window_size - 1; i++) {
         if (i < ys.length) {
-          acc.x += +xs[i];
+          acc.x += ms(xs[i]);
           acc.y += ys[i];
           acc.count++;
         }
         if (i >= window_size) {
-          acc.x -= +xs[i - window_size];
+          acc.x -= ms(xs[i - window_size]);
           acc.y -= ys[i - window_size];
           acc.count--;
         }
@@ -259,18 +292,18 @@ const filters = {
     (params) => {
       const { xs, ys, ...rest } = force_numeric(params);
       const ys2: number[] = [];
-      const xs2: Date[] = [];
+      const xs2: FilterData["xs"] = [];
       let acc = {
         ys: [] as number[],
         x: 0,
       };
       for (let i = 0; i < ys.length + window_size - 1; i++) {
         if (i < ys.length) {
-          acc.x += +xs[i];
+          acc.x += ms(xs[i]);
           acc.ys.push(ys[i]);
         }
         if (i >= window_size) {
-          acc.x -= +xs[i - window_size];
+          acc.x -= ms(xs[i - window_size]);
           acc.ys.shift();
         }
         if (shouldEmitWindow(i, ys.length, window_size, extended, centered)) {
@@ -342,16 +375,20 @@ const filters = {
       typeof intervalOrObject == "string"
         ? { interval: intervalOrObject }
         : intervalOrObject;
-    return ({ xs, ys, states, statistics }) => {
+    const interval = parseTimeDuration(intervalStr);
+    if (!Number.isFinite(interval) || interval <= 0)
+      throw new Error("resample: interval must be greater than zero");
+    return ({ xs, ys, states, statistics, timeZone }) => {
       const data = {
         xs: [] as Date[],
         ys: [] as YValue[],
         states: [] as HassEntity[],
         statistics: [] as StatisticValue[],
       };
+      if (!xs.length) return data;
       // Linear interpolation between neighbours, or hold the last value
       const lerp = (x: number, i: number) => {
-        const [xa, xb, ya, yb] = [+xs[i], +xs[i + 1], ys[i], ys[i + 1]];
+        const [xa, xb, ya, yb] = [ms(xs[i]), ms(xs[i + 1]), ys[i], ys[i + 1]];
         if (
           typeof ya !== "number" ||
           typeof yb !== "number" ||
@@ -361,12 +398,19 @@ const filters = {
           return ys[i];
         return ya + ((yb - ya) * (x - xa)) / (xb - xa);
       };
-      const interval = parseTimeDuration(intervalStr);
-      const x0 = Math.floor(+xs[0] / interval) * interval;
-      const x1 = +xs[xs.length - 1];
+      const calendar = intervalStr.endsWith("d")
+        ? calendarInterval(intervalStr, timeZone)
+        : undefined;
+      const x0 =
+        calendar?.floor(ms(xs[0])) ??
+        Math.floor(ms(xs[0]) / interval) * interval;
+      const next = calendar
+        ? (x: number) => calendar.next(x)
+        : (x: number) => x + interval;
+      const x1 = ms(xs[xs.length - 1]);
       let i = 0;
-      for (let x = x0; x < x1; x += interval) {
-        while (+xs[i + 1] <= x && i < xs.length - 1) {
+      for (let x = x0; x < x1; x = next(x)) {
+        while (ms(xs[i + 1]) <= x && i < xs.length - 1) {
           i++;
         }
         data.xs.push(new Date(x));
@@ -386,6 +430,49 @@ const filters = {
     ({ vars, xs, ys, states, statistics, meta }) => ({
       vars: { ...vars, [var_name]: { xs, ys, states, statistics, meta } },
     }),
+  align_timestamps:
+    (names: string | string[]): FilterFn =>
+    ({ xs, vars }) => {
+      if (vars.aligned !== undefined && !alignedVars.has(vars.aligned))
+        throw new Error(
+          "align_timestamps: 'aligned' is reserved for aligned series, rename that stored var",
+        );
+      // Only dates and numbers are instants; anything else never matches.
+      const instant = (x: unknown) =>
+        x instanceof Date || typeof x === "number" ? ms(x) : NaN;
+      const timestamps = xs.map(instant);
+      const aligned: Record<string, unknown> = {};
+      alignedVars.add(aligned);
+      for (const name of typeof names === "string" ? [names] : names) {
+        const source = vars[name];
+        if (!Array.isArray(source?.xs) || !Array.isArray(source?.ys))
+          throw new Error(`align_timestamps: '${name}' is not a stored series`);
+        // Match exact instants without changing the stored series' time grid.
+        const byTime = new Map<number, number>();
+        // Skip x values that are not instants: every NaN would be the same key.
+        source.xs.forEach((x: unknown, index: number) => {
+          const time = instant(x);
+          if (Number.isFinite(time)) byTime.set(time, index);
+        });
+        const indices = timestamps.map((time) => byTime.get(time));
+        const project = (values: unknown[]) =>
+          values?.length
+            ? indices.map((index) =>
+                index === undefined ? null : (values[index] ?? null),
+              )
+            : [];
+        aligned[name] = {
+          ...source,
+          xs,
+          ys: indices.map((index) =>
+            index === undefined ? null : (source.ys[index] ?? null),
+          ),
+          states: project(source.states),
+          statistics: project(source.statistics),
+        };
+      }
+      return { vars: { ...vars, aligned } };
+    },
   trendline: (p3: TrendlineType | Partial<TrendlineParam> = "linear") => {
     let p2: Partial<TrendlineParam> = {};
     if (typeof p3 == "string") {
@@ -400,9 +487,9 @@ const filters = {
     const forecast = parseTimeDuration(p.forecast);
     return (data) => {
       const { xs, ys, meta, ...rest } = force_numeric(data);
-      const t0 = +xs[0] - 0.1; // otherwise the power series doesn't work
-      const t1 = +xs[xs.length - 1];
-      const xs_numbers = xs.map((x) => +x - t0);
+      const t0 = ms(xs[0]) - 0.1; // otherwise the power series doesn't work
+      const t1 = ms(xs[xs.length - 1]);
+      const xs_numbers = xs.map((x) => ms(x) - t0);
       let RegressionClass = trendlineTypes[p.type];
       if (!RegressionClass) {
         throw new Error(
@@ -440,7 +527,12 @@ const filters = {
       if (p.show_formula) extras.push(regression.toString(2));
       return {
         ...rest,
-        xs: xs_numbers.map((x) => new Date(x + t0)),
+        xs: [
+          ...xs,
+          ...xs_numbers
+            .slice(xs.length)
+            .map((x) => (xs[0] instanceof Date ? new Date(x + t0) : x + t0)),
+        ],
         ys: ys_out,
         meta: {
           ...meta,

@@ -1,4 +1,5 @@
 import type { HomeAssistant } from "custom-card-helpers";
+import type { HATheme } from "./themed-layout";
 import type { InputConfig } from "../types";
 import { ConfigParser } from "./parse-config";
 
@@ -11,7 +12,7 @@ const cssVars = {
   "font-family": "",
   "font-size": "",
   "font-weight": "",
-};
+} as HATheme;
 
 const hass = {
   locale: { language: "en", first_weekday: "language" },

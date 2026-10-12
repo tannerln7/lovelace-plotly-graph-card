@@ -1,18 +1,25 @@
+import type { Mock } from "vitest";
 import { HomeAssistant } from "custom-card-helpers";
-import { Statistics, StatisticValue } from "../recorder-types";
+import { STATISTIC_TYPES, Statistics, StatisticValue } from "../recorder-types";
 import { EntityConfig, InputConfig } from "../types";
 import { ConfigParser } from "./parse-config";
-import { HATheme } from "./themed-layout";
+import { HATheme, readThemeColors } from "./themed-layout";
 import { getEntityKey } from "../cache/Cache";
 
-jest.mock("../filters/filters", () => ({
-  __esModule: true,
-  default: {},
+vi.mock("../filters/filters", () => ({
+  default: {
+    multiply:
+      (factor: number) =>
+      ({ ys }: { ys: number[] }) => ({
+        ys: ys.map((value) => value * factor),
+      }),
+  },
 }));
 
 const NOW = Date.parse("2025-01-02T12:00:00.000Z");
 const yValues = (trace: EntityConfig) => ("y" in trace ? trace.y : undefined);
 const cssVars: HATheme = {
+  ...readThemeColors({ getPropertyValue: () => "" }),
   "card-background-color": "#fff",
   "primary-background-color": "#fff",
   "primary-color": "#000",
@@ -50,18 +57,31 @@ function statistic(statisticId: string, mean: number): StatisticValue {
 }
 
 function successfulCallWS() {
-  return jest.fn(async ({ statistic_ids }) =>
+  return vi.fn(async ({ statistic_ids, types }) =>
     Object.fromEntries(
       statistic_ids.map((entityId: string, i: number) => [
         entityId,
-        [statistic(entityId, i + 1)],
+        [selectFields(statistic(entityId, i + 1), types)],
       ]),
     ),
   );
 }
 
+function selectFields(row: StatisticValue, types?: string[]) {
+  if (!types) return row;
+  const selected: StatisticValue = {
+    statistic_id: row.statistic_id,
+    start: row.start,
+    end: row.end,
+  };
+  for (const type of STATISTIC_TYPES) {
+    if (types.includes(type)) selected[type] = row[type];
+  }
+  return selected;
+}
+
 function createHass(
-  callWS: jest.Mock<Promise<Statistics>, [Record<string, any>]>,
+  callWS: Mock<(params: Record<string, any>) => Promise<Statistics>>,
 ): HomeAssistant {
   return {
     callWS,
@@ -75,9 +95,13 @@ function createHass(
 
 function update(
   parser: ConfigParser,
-  callWS: jest.Mock<Promise<Statistics>, [Record<string, any>]>,
+  callWS: Mock<(params: Record<string, any>) => Promise<Statistics>>,
   entities = compatibleEntities,
-  config: Partial<InputConfig> & { visible_range?: [number, number] } = {},
+  config: Partial<InputConfig> & {
+    visible_range?: [number, number];
+    fetch_mask?: boolean[];
+  } = {},
+  now?: number,
 ) {
   return parser.update({
     yaml: {
@@ -88,6 +112,7 @@ function update(
     },
     hass: createHass(callWS),
     css_vars: cssVars,
+    now,
   });
 }
 
@@ -97,11 +122,95 @@ describe("statistics request batching", () => {
   });
 
   beforeEach(() => {
-    jest.spyOn(Date, "now").mockReturnValue(NOW);
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps calendar ranges and fetch cutoffs on the supplied snapshot across midnight", async () => {
+    const snapshot = Date.parse("2025-01-02T23:59:59.998Z");
+    vi.spyOn(Date, "now").mockReturnValue(snapshot + 4);
+    const callWS = successfulCallWS();
+    const result = await update(
+      new ConfigParser(),
+      callWS,
+      compatibleEntities,
+      { hours_to_show: "current_day", time_zone: "UTC" },
+      snapshot,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.parsed.visible_range).toEqual([
+      Date.parse("2025-01-02T00:00:00.000Z"),
+      Date.parse("2025-01-02T23:59:59.999Z"),
+    ]);
+    expect(callWS.mock.calls[0][0].end_time).toBe(
+      new Date(snapshot).toISOString(),
+    );
+  });
+
+  it("leaves a user-defined range function on its own clock", async () => {
+    const yaml = {
+      type: "custom:plotly-graph" as const,
+      visible_range: (): [number, number] => [
+        Date.now() - 3600000,
+        Date.now() - 60000,
+      ],
+      entities: compatibleEntities,
+    };
+    const result = await new ConfigParser().update({
+      yaml,
+      hass: createHass(successfulCallWS()),
+      css_vars: cssVars,
+      now: NOW - 50000,
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.parsed.visible_range).toEqual([NOW - 3600000, NOW - 60000]);
+  });
+
+  it("draws dates in the configured timezone", async () => {
+    const callWS = successfulCallWS();
+    const result = await update(
+      new ConfigParser(),
+      callWS,
+      compatibleEntities,
+      {
+        time_zone: "Pacific/Chatham",
+        hours_to_show: "1h",
+      },
+    );
+
+    expect(result.errors).toEqual([]);
+    // NOW is 12:00Z, i.e. 01:45 next day in Chatham (UTC+13:45)
+    expect(result.parsed.layout.xaxis!.range).toEqual([
+      "2025-01-03 00:45:00.000",
+      "2025-01-03 01:45:00.000",
+    ]);
+    expect(result.parsed.visible_range).toEqual([NOW - 3600000, NOW]);
+    for (const trace of result.parsed.entities)
+      for (const x of (trace as any).x) expect(typeof x).toBe("string");
+  });
+
+  it("falls back to the browser's timezone for an invalid time_zone", async () => {
+    const callWS = successfulCallWS();
+    const result = await update(
+      new ConfigParser(),
+      callWS,
+      compatibleEntities,
+      {
+        time_zone: "Mars/Olympus",
+        hours_to_show: "current_day",
+      },
+    );
+
+    expect(result.errors.map((e) => e.message)).toEqual([
+      "time_zone: unknown timezone 'Mars/Olympus'",
+    ]);
+    const start = new Date(NOW);
+    start.setHours(0, 0, 0, 0);
+    expect(result.parsed.visible_range[0]).toBe(+start);
+    expect(result.parsed.entities.map(yValues)).toEqual([[1], [2]]);
   });
 
   it("fetches compatible statistics entities in one request", async () => {
@@ -116,6 +225,7 @@ describe("statistics request batching", () => {
       type: "recorder/statistics_during_period",
       statistic_ids: ["sensor.east", "sensor.west"],
       period: "5minute",
+      types: ["mean"],
     });
     expect(result.parsed.entities.map(yValues)).toEqual([[1], [2]]);
 
@@ -129,14 +239,15 @@ describe("statistics request batching", () => {
       timestamp: NOW + (i - 24) * hour,
       value: i,
     }));
-    const callWS = jest.fn(async ({ statistic_ids, start_time, end_time }) =>
+    const callWS = vi.fn(async ({ statistic_ids, start_time, end_time }) =>
       Object.fromEntries(
         statistic_ids.map((id: string) => [
           id,
           samples
-            .filter(({ timestamp }) =>
-              timestamp >= Date.parse(start_time) &&
-              timestamp <= Date.parse(end_time),
+            .filter(
+              ({ timestamp }) =>
+                timestamp >= Date.parse(start_time) &&
+                timestamp <= Date.parse(end_time),
             )
             .map(({ timestamp, value }) => ({
               ...statistic(id, value),
@@ -150,14 +261,15 @@ describe("statistics request batching", () => {
 
     for (let elapsed = 0; elapsed <= 6; elapsed++) {
       const now = NOW + elapsed * hour;
-      jest.mocked(Date.now).mockReturnValue(now);
+      vi.mocked(Date.now).mockReturnValue(now);
       const result = await update(parser, callWS, compatibleEntities, {
         hours_to_show: 3,
       });
       expect(result.errors).toEqual([]);
       expect(callWS).toHaveBeenCalledTimes(elapsed + 1);
       expect(callWS.mock.calls[elapsed][0].statistic_ids).toEqual([
-        "sensor.east", "sensor.west",
+        "sensor.east",
+        "sensor.west",
       ]);
       const expected = [21, 22, 23, 24].map((value) => value + elapsed);
       expect(result.parsed.entities.map(yValues)).toEqual([expected, expected]);
@@ -166,6 +278,7 @@ describe("statistics request batching", () => {
           entity,
           statistic: "mean",
           period: "5minute",
+          types: ["mean"],
         });
         expect(parser.cache.histories[key]).toHaveLength(4);
         expect(parser.cache.ranges[key]).toEqual([[now - 3 * hour, now]]);
@@ -178,10 +291,15 @@ describe("statistics request batching", () => {
     expect(result.errors).toEqual([]);
     expect(callWS).toHaveBeenCalledTimes(8);
     expect(callWS.mock.calls[7][0].statistic_ids).toEqual([
-      "sensor.east", "sensor.west",
+      "sensor.east",
+      "sensor.west",
     ]);
-    expect(result.parsed.entities.map((trace) => yValues(trace)?.slice(0, 4)))
-      .toEqual([[21, 22, 23, 24], [21, 22, 23, 24]]);
+    expect(
+      result.parsed.entities.map((trace) => yValues(trace)?.slice(0, 4)),
+    ).toEqual([
+      [21, 22, 23, 24],
+      [21, 22, 23, 24],
+    ]);
   });
 
   it("keeps incompatible statistics periods in separate requests", async () => {
@@ -230,8 +348,8 @@ describe("statistics request batching", () => {
     const callWS = successfulCallWS();
     const parser = new ConfigParser();
     callWS.mockRejectedValueOnce(new Error("batch failed"));
-    jest.spyOn(console, "error").mockImplementation();
-    jest.spyOn(console, "warn").mockImplementation();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const result = await update(parser, callWS);
 
@@ -275,17 +393,166 @@ describe("statistics request batching", () => {
   });
 
   it("shares a response between different statistics for the same entity", async () => {
-    const callWS = jest.fn(async (_request: Record<string, any>) => ({
-      "sensor.east": [{ ...statistic("sensor.east", 4), max: 8 }],
+    const callWS = vi.fn(async ({ types }: Record<string, any>) => ({
+      "sensor.east": [
+        selectFields({ ...statistic("sensor.east", 4), min: 2, max: 8 }, types),
+      ],
     }));
     const result = await update(new ConfigParser(), callWS, [
+      { entity: "sensor.east", statistic: "min", period: "hour" },
+      {
+        entity: "sensor.east",
+        statistic: "max",
+        period: "hour",
+        fill: "tonexty",
+      },
       { entity: "sensor.east", statistic: "mean", period: "hour" },
-      { entity: "sensor.east", statistic: "max", period: "hour" },
+      { entity: "sensor.east", statistic: "mean", period: "hour" },
     ]);
     expect(result.errors).toEqual([]);
     expect(callWS).toHaveBeenCalledTimes(1);
     expect(callWS.mock.calls[0][0].statistic_ids).toEqual(["sensor.east"]);
+    expect(callWS.mock.calls[0][0].types).toEqual(["max", "mean", "min"]);
+    expect(result.parsed.entities.map(yValues)).toEqual([[2], [8], [4], [4]]);
+  });
+
+  it("includes the default mean for period-only traces alongside max", async () => {
+    const callWS = vi.fn(async ({ types }: Record<string, any>) => ({
+      "sensor.east": [
+        selectFields({ ...statistic("sensor.east", 4), max: 8 }, types),
+      ],
+    }));
+    const result = await update(new ConfigParser(), callWS, [
+      { entity: "sensor.east", period: "hour" },
+      { entity: "sensor.east", statistic: "max", period: "hour" },
+    ]);
+    expect(result.errors).toEqual([]);
     expect(result.parsed.entities.map(yValues)).toEqual([[4], [8]]);
+    expect(callWS).toHaveBeenCalledTimes(1);
+    expect(callWS.mock.calls[0][0].types).toEqual(["max", "mean"]);
+  });
+
+  it("includes statistics supplied by entity defaults", async () => {
+    const callWS = successfulCallWS();
+    const result = await update(
+      new ConfigParser(),
+      callWS,
+      [{ entity: "sensor.east" }, { entity: "sensor.west", statistic: "max" }],
+      {
+        defaults: { entity: { period: "hour", statistic: "min" } },
+      } as unknown as Partial<InputConfig>,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.parsed.entities.map(yValues)).toEqual([[1], [2]]);
+    expect(callWS).toHaveBeenCalledTimes(1);
+    expect(callWS.mock.calls[0][0].types).toEqual(["max", "min"]);
+  });
+
+  it("keeps field coverage for cached traces when another trace is refreshed", async () => {
+    const parser = new ConfigParser();
+    const callWS = successfulCallWS();
+    const entities: InputConfig["entities"] = [
+      { entity: "sensor.east", statistic: "mean", period: "hour" },
+      { entity: "sensor.west", statistic: "max", period: "hour" },
+    ];
+    await update(parser, callWS, entities);
+    const result = await update(parser, callWS, entities, {
+      fetch_mask: [false, true],
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.parsed.entities.map(yValues)).toEqual([[1], [2]]);
+    expect(callWS).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reuse a partial response when the configured statistic changes", async () => {
+    const parser = new ConfigParser();
+    const callWS = vi.fn(async ({ types }: Record<string, any>) => ({
+      "sensor.east": [
+        selectFields({ ...statistic("sensor.east", 4), max: 8 }, types),
+      ],
+    }));
+    const mean = {
+      entity: "sensor.east",
+      statistic: "mean",
+      period: "hour",
+    } as const;
+    expect(
+      (await update(parser, callWS, [mean])).parsed.entities.map(yValues),
+    ).toEqual([[4]]);
+    expect(
+      (
+        await update(parser, callWS, [{ ...mean, statistic: "max" }])
+      ).parsed.entities.map(yValues),
+    ).toEqual([[8]]);
+    expect(callWS.mock.calls.map(([request]) => request.types)).toEqual([
+      ["mean"],
+      ["max"],
+    ]);
+  });
+
+  it.each([
+    { filters: [{ multiply: 2 }] },
+    { name: (() => "Temperature") as any },
+    { statistic: "$ex 'mean'" as any },
+  ])(
+    "keeps full statistics for user filters or functions: %p",
+    async (extra) => {
+      const callWS = successfulCallWS();
+      const result = await update(new ConfigParser(), callWS, [
+        { ...compatibleEntities[0], ...extra },
+      ]);
+      expect(result.errors).toEqual([]);
+      expect(result.parsed.entities.map(yValues)).toEqual([
+        ["filters" in extra ? 2 : 1],
+      ]);
+      expect(callWS.mock.calls[0][0]).not.toHaveProperty("types");
+    },
+  );
+
+  it("keeps full statistics for filters supplied by defaults or presets", async () => {
+    const callWS = successfulCallWS();
+    for (const config of [
+      { defaults: { entity: { filters: [{ multiply: 2 }] } } },
+      { preset: "custom" },
+    ]) {
+      const result = await update(
+        new ConfigParser(),
+        callWS,
+        compatibleEntities,
+        config as unknown as Partial<InputConfig>,
+      );
+      expect(result.errors).toEqual([]);
+      expect(result.parsed.entities.map(yValues)).toEqual(
+        "defaults" in config ? [[2], [4]] : [[1], [2]],
+      );
+    }
+    expect(callWS).toHaveBeenCalledTimes(2);
+    for (const [request] of callWS.mock.calls) {
+      expect(request).not.toHaveProperty("types");
+    }
+  });
+
+  it("optimizes time-axis expressions without exposing partial statistics outside entities", async () => {
+    const callWS = successfulCallWS();
+    const result = await new ConfigParser().update({
+      yaml: {
+        type: "custom:plotly-graph",
+        visible_range: `$fn () => [${NOW - 24 * 3600000}, ${NOW}]`,
+        entities: compatibleEntities,
+        layout: {
+          title: {
+            text: "$fn ({ statistics }) => statistics === undefined ? 'No entity statistics' : 'Unexpected statistics'",
+          },
+        },
+      } as InputConfig,
+      hass: createHass(callWS),
+      css_vars: cssVars,
+    });
+    expect(result.errors).toEqual([]);
+    expect(callWS.mock.calls[0][0].types).toEqual(["mean"]);
+    expect(result.parsed.layout.title).toMatchObject({
+      text: "No entity statistics",
+    });
   });
 
   it("does not combine different time offsets", async () => {
@@ -332,7 +599,7 @@ describe("statistics request batching", () => {
 
   it("does not prefetch an unevaluated dynamic time range", async () => {
     const callWS = successfulCallWS();
-    jest.spyOn(console, "warn").mockImplementation();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = await new ConfigParser().update({
       yaml: {
         type: "custom:plotly-graph",
@@ -352,8 +619,8 @@ describe("statistics request batching", () => {
 
   it("skips batching an invalid time range without a batching warning", async () => {
     const callWS = successfulCallWS();
-    const warn = jest.spyOn(console, "warn").mockImplementation();
-    jest.spyOn(console, "error").mockImplementation();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await new ConfigParser().update({
       yaml: {
         type: "custom:plotly-graph",
@@ -399,10 +666,10 @@ describe("statistics request batching", () => {
   });
 
   it("reports errors when both the batch and individual requests fail", async () => {
-    const callWS = jest.fn().mockRejectedValue(new Error("offline"));
+    const callWS = vi.fn().mockRejectedValue(new Error("offline"));
     const parser = new ConfigParser();
-    jest.spyOn(console, "error").mockImplementation();
-    jest.spyOn(console, "warn").mockImplementation();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = await update(parser, callWS);
     expect(result.errors.length).toBeGreaterThan(0);
     expect(callWS).toHaveBeenCalledTimes(3);
@@ -416,26 +683,26 @@ describe("statistics request batching", () => {
   it.each([undefined, "temperature"])(
     "reuses history failures for attribute %s and retries on the next update",
     async (attribute) => {
-      const callApi = jest.fn().mockRejectedValue(new Error("offline"));
+      const callWS = vi.fn().mockRejectedValue(new Error("offline"));
       const parser = new ConfigParser();
-      jest.spyOn(console, "error").mockImplementation();
-      jest.spyOn(console, "warn").mockImplementation();
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "warn").mockImplementation(() => {});
       const input = {
         yaml: {
           type: "custom:plotly-graph" as const,
           hours_to_show: 24,
           entities: [{ entity: "sensor.east", attribute }],
         },
-        hass: { ...createHass(successfulCallWS()), callApi },
+        hass: createHass(callWS),
         css_vars: cssVars,
       };
 
       const failed = await parser.update(input);
       expect(failed.errors.length).toBeGreaterThan(0);
-      expect(callApi).toHaveBeenCalledTimes(1);
+      expect(callWS).toHaveBeenCalledTimes(1);
 
-      callApi.mockResolvedValue([
-        [
+      callWS.mockResolvedValue({
+        "sensor.east": [
           {
             entity_id: "sensor.east",
             state: "4",
@@ -443,10 +710,10 @@ describe("statistics request batching", () => {
             last_changed: "2025-01-02T11:00:00.000Z",
           },
         ],
-      ]);
+      });
       const recovered = await parser.update(input);
       expect(recovered.errors).toEqual([]);
-      expect(callApi).toHaveBeenCalledTimes(2);
+      expect(callWS).toHaveBeenCalledTimes(2);
       expect(yValues(recovered.parsed.entities[0])).toEqual(
         attribute ? [8, 8] : ["4", "4"],
       );
@@ -454,10 +721,9 @@ describe("statistics request batching", () => {
   );
 
   it("keeps failures separate for state, attribute, statistics and time ranges", async () => {
-    const callApi = jest.fn().mockRejectedValue(new Error("offline"));
-    const callWS = jest.fn().mockRejectedValue(new Error("offline"));
-    jest.spyOn(console, "error").mockImplementation();
-    jest.spyOn(console, "warn").mockImplementation();
+    const callWS = vi.fn().mockRejectedValue(new Error("offline"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     await new ConfigParser().update({
       yaml: {
         type: "custom:plotly-graph",
@@ -471,11 +737,18 @@ describe("statistics request batching", () => {
           { entity: "sensor.east", attribute: "humidity" },
         ],
       },
-      hass: { ...createHass(callWS), callApi },
+      hass: createHass(callWS),
       css_vars: cssVars,
     });
     // Attributes share one history response; states, statistics and offsets do not.
-    expect(callApi).toHaveBeenCalledTimes(3);
-    expect(callWS).toHaveBeenCalledTimes(1);
+    // One failed history batch, then one attempt per distinct fetch key/range.
+    expect(callWS).toHaveBeenCalledTimes(5);
+    expect(callWS.mock.calls.map(([request]) => request.type)).toEqual([
+      "history/history_during_period",
+      "history/history_during_period",
+      "history/history_during_period",
+      "recorder/statistics_during_period",
+      "history/history_during_period",
+    ]);
   });
 });

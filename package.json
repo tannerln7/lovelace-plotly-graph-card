@@ -1,42 +1,55 @@
 {
   "name": "plotly-graph-card",
   "version": "to-be-set-on-release",
-  "description": "",
-  "main": "index.js",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0",
+    "npm": "please use bun install",
+    "pnpm": "please use bun install",
+    "yarn": "please use bun install"
   },
   "scripts": {
-    "start": "(node ./script/hot-reload.mjs & esbuild src/plotly-graph-card.ts --servedir=dist --outdir=dist --bundle --sourcemap=inline)",
-    "build": "esbuild src/plotly-graph-card.ts --outdir=dist --bundle --minify",
+    "start": "(node ./script/hot-reload.mjs & node build.mjs --watch)",
+    "build": "node build.mjs",
     "tsc": "tsc",
-    "test": "jest",
-    "test:cache": "jest --runInBand src/cache/Cache.test.ts src/cache/date-ranges.test.ts src/cache/observed-range.test.ts src/parse-config/cache-retention.test.ts",
-    "test:statistics": "jest --runInBand src/cache/fetch-statistics.test.ts src/cache/statistics-cache.test.ts src/cache/date-ranges.test.ts src/parse-config/parse-config.test.ts",
+    "lint:check": "oxfmt --check && oxlint --type-aware --type-check --deny-warnings --ignore-pattern=yaml-editor",
+    "lint:fix": "oxfmt && oxlint --type-aware --type-check --deny-warnings --ignore-pattern=yaml-editor --fix",
+    "lint:yaml-editor": "oxlint --type-aware --type-check --deny-warnings yaml-editor",
+    "test": "vitest run",
+    "test:cache": "vitest run src/cache/Cache.test.ts src/cache/date-ranges.test.ts src/cache/observed-range.test.ts src/parse-config/cache-retention.test.ts",
+    "test:statistics": "vitest run src/cache/fetch-statistics.test.ts src/cache/statistics-cache.test.ts src/cache/date-ranges.test.ts src/parse-config/parse-config.test.ts",
     "test:browser": "node script/test-plotly-browser.mjs",
+    "test:autorange": "node script/test-autorange.mjs",
+    "test:loading": "node script/test-loading-state.mjs",
+    "test:resize": "node script/test-resize.mjs",
+    "test:zero-alignment": "node script/test-zero-alignment.mjs",
     "test:card-lifecycle": "node script/test-card-lifecycle.mjs",
-    "test:watch": "jest --watchAll",
-    "version": "npm run build && git add .",
-    "npm-upgrade": "npx npm-upgrade"
+    "test:touch": "node script/test-touch-gestures.mjs",
+    "test:split": "node script/test-split-build.mjs",
+    "test:watch": "vitest"
   },
-  "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@types/jest": "^29.2.4",
     "@types/lodash": "^4.14.191",
-    "@types/node": "^18.11.17",
+    "@types/node": "^24.19.1",
     "@types/ws": "^8.5.4",
-    "chokidar": "^3.5.3",
-    "esbuild": "^0.16.10",
+    "chokidar": "^4.0.3",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "oxlint-tsgolint": "^7.0.2003",
     "playwright": "1.63.0",
-    "ts-jest": "^29.4.13",
+    "rolldown": "^1.2.12",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3",
     "ws": "^8.12.0"
   },
   "dependencies": {
+    "@date-fns/tz": "^1.5.0",
+    "assert": "^2.1.0",
     "binary-search-bounds": "^2.0.5",
     "buffer": "^6.0.3",
     "custom-card-helpers": "^1.9.0",
-    "date-fns": "^2.29.3",
+    "date-fns": "^4.4.0",
     "deepmerge": "^4.2.2",
     "fourier-transform": "^1.1.2",
     "lodash": "^4.17.21",
@@ -50,9 +63,13 @@
     "ml-regression-theil-sen": "^2.0.0",
     "ndarray": "^1.0.19",
     "ndarray-fft": "^1.0.3",
-    "plotly.js": "4.1.1",
-    "prettier": "^3.3.3",
+    "plotly.js": "4.1.2",
+    "process": "^0.11.10",
     "propose": "^0.0.5",
-    "typescript": "^5.6.3"
+    "stream": "npm:stream-browserify@^3.0.0"
+  },
+  "overrides": {
+    "static-eval": "^2.1.1",
+    "minimist": "^1.2.8"
   }
 }

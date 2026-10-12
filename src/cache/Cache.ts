@@ -1,7 +1,13 @@
 import { HomeAssistant } from "custom-card-helpers";
+import type { StatisticPeriod } from "../recorder-types";
 import { compactRanges, subtractRanges } from "./date-ranges";
 import fetchStatistics from "./fetch-statistics";
-import fetchStates from "./fetch-states";
+import fetchStates, { fetchStatesBatch } from "./fetch-states";
+import {
+  getStatisticsUpdatePeriod,
+  isLiveStatisticsRange,
+  StatisticsUpdatePeriod,
+} from "./statistics-refresh";
 import {
   TimestampRange,
   isEntityIdAttrConfig,
@@ -13,13 +19,10 @@ import {
   CachedStateEntity,
   EntityData,
   EntityIdStatisticsConfig,
+  StatisticsFetchConfig,
 } from "../types";
-type FetchConfig =
-  | {
-      statistic: "state" | "sum" | "min" | "max" | "mean";
-      period: "5minute" | "hour" | "day" | "week" | "month";
-      entity: string;
-    }
+export type FetchConfig =
+  | StatisticsFetchConfig
   | {
       attribute: string;
       entity: string;
@@ -27,9 +30,17 @@ type FetchConfig =
   | {
       entity: string;
     };
+export type HistoryFetchConfig = Exclude<
+  FetchConfig,
+  { statistic: string; period: string }
+>;
+export type HistoryFetchRequest = {
+  entity: HistoryFetchConfig;
+  range: TimestampRange;
+};
 export function mapValues<T, S>(
   o: Record<string, T>,
-  fn: (value: T, key: string) => S
+  fn: (value: T, key: string) => S,
 ) {
   return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, fn(v, k)]));
 }
@@ -47,10 +58,11 @@ function getFetchRange([startT, endT]: number[], now = Date.now()) {
 async function fetchSingleRange(
   hass: HomeAssistant,
   entity: FetchConfig,
-  [startT, endT]: number[]
+  [startT, endT]: number[],
 ): Promise<{
   range: [number, number];
   history: CachedEntity[];
+  fetchedAt: number;
 }> {
   // We fetch slightly more than requested (i.e the range visible in the screen). The reason is the following:
   // When fetching data in a range `[startT,endT]`, Home Assistant adds a fictitious datapoint at
@@ -91,13 +103,14 @@ async function fetchSingleRange(
   //
   // The above does not apply to statistics data where there are no fake data points.
 
-  const { dates, range } = getFetchRange([startT, endT]);
+  const fetchedAt = Date.now();
+  const { dates, range } = getFetchRange([startT, endT], fetchedAt);
   let history: CachedEntity[];
   if (isEntityIdStatisticsConfig(entity)) {
     history = (await fetchStatistics(hass, [entity], dates))[entity.entity];
   } else {
     history = await fetchStates(hass, entity, dates);
-    if (history.length) {
+    if (history.length && +history[0].x <= +dates[0]) {
       history[0].fake_boundary_datapoint = true;
     }
   }
@@ -105,6 +118,7 @@ async function fetchSingleRange(
   return {
     range,
     history,
+    fetchedAt,
   };
 }
 
@@ -112,7 +126,11 @@ export function getEntityKey(entity: FetchConfig) {
   if (isEntityIdAttrConfig(entity)) {
     return `${entity.entity}::attribute:`;
   } else if (isEntityIdStatisticsConfig(entity)) {
-    return `${entity.entity}::statistics::${entity.period}`;
+    const types =
+      "types" in entity && entity.types?.length
+        ? `::types:${entity.types.join(",")}`
+        : "";
+    return `${entity.entity}::statistics::${entity.period}${types}`;
   } else if (isEntityIdStateConfig(entity)) {
     return `${entity.entity}`;
   }
@@ -126,7 +144,7 @@ function upperBound(history: CachedEntity[], timestamp: number) {
   let high = history.length;
   while (low < high) {
     const middle = Math.floor((low + high) / 2);
-    if (+history[middle].x <= timestamp) low = middle + 1;
+    if (history[middle].x.getTime() <= timestamp) low = middle + 1;
     else high = middle;
   }
   return low;
@@ -134,9 +152,10 @@ function upperBound(history: CachedEntity[], timestamp: number) {
 
 function selectHistory(
   history: CachedEntity[],
-  ranges: TimestampRange[]
+  ranges: TimestampRange[],
 ): CachedEntity[] {
   const selected: CachedEntity[] = [];
+  let next = 0; // cached timestamps are unique, so skip by index
   for (const [start, end] of compactRanges(ranges)) {
     // Keep the latest point at or before the range so the trace reaches the
     // left edge even when no state changed there.
@@ -144,18 +163,16 @@ function selectHistory(
     const first = Math.max(0, firstAfterStart - 1);
     const last = upperBound(history, end);
     if (first === 0 && last === history.length) return history;
-    for (let index = first; index < last; index++) {
-      const state = history[index];
-      const previous = selected[selected.length - 1];
-      if (!previous || +previous.x !== +state.x) selected.push(state);
-    }
+    for (let index = Math.max(first, next); index < last; index++)
+      selected.push(history[index]);
+    next = Math.max(next, last);
   }
   return selected;
 }
 
 function intersectRanges(
   cachedRanges: TimestampRange[],
-  retainedRanges: TimestampRange[]
+  retainedRanges: TimestampRange[],
 ) {
   return compactRanges(
     cachedRanges.flatMap(([cachedStart, cachedEnd]) =>
@@ -163,8 +180,8 @@ function intersectRanges(
         const start = Math.max(cachedStart, retainedStart);
         const end = Math.min(cachedEnd, retainedEnd);
         return start <= end ? [[start, end]] : [];
-      })
-    )
+      }),
+    ),
   );
 }
 
@@ -172,6 +189,84 @@ export default class Cache {
   ranges: Record<string, TimestampRange[]> = {};
   histories: Record<string, CachedEntity[]> = {};
   busy: Promise<unknown> = Promise.resolve(); // mutex
+  private mutableStatistics: Record<
+    string,
+    { from: number; fetchedAt: number; period: StatisticPeriod }
+  > = {};
+  private mutableHistory: Record<string, { from: number; fetchedAt: number }> =
+    {};
+
+  private refreshHistory(entity: HistoryFetchConfig, now: number) {
+    const key = getEntityKey(entity);
+    const mutable = this.mutableHistory[key];
+    if (!mutable || mutable.fetchedAt >= now) return;
+    this.ranges[key] = subtractRanges(this.ranges[key] || [], [
+      [mutable.from, Number.POSITIVE_INFINITY],
+    ]);
+    delete this.mutableHistory[key];
+  }
+
+  private trackMutableHistory(
+    entity: HistoryFetchConfig,
+    history: CachedEntity[],
+    range: TimestampRange,
+    fetchedAt: number,
+  ) {
+    if (range[1] < fetchedAt) return;
+    const latest = history.at(-1);
+    // Recorder may still be committing states behind the request's end time.
+    // Only the last real row confirms coverage; a synthetic boundary does not.
+    this.mutableHistory[getEntityKey(entity)] = {
+      from:
+        latest && !latest.fake_boundary_datapoint
+          ? Math.max(range[0], +latest.x + 1)
+          : range[0],
+      fetchedAt,
+    };
+  }
+
+  refreshStatistics(now: number, period?: StatisticsUpdatePeriod) {
+    if (Object.keys(this.mutableStatistics).length === 0) return;
+    return this.enqueue(async () => {
+      for (const [key, mutable] of Object.entries(this.mutableStatistics)) {
+        if (period && getStatisticsUpdatePeriod(mutable.period) !== period)
+          continue;
+        if (mutable.fetchedAt >= now) continue;
+        this.ranges[key] = subtractRanges(this.ranges[key] || [], [
+          [mutable.from, Number.POSITIVE_INFINITY],
+        ]);
+        delete this.mutableStatistics[key];
+      }
+    });
+  }
+
+  private trackMutableStatistics(
+    entity: EntityIdStatisticsConfig,
+    history: CachedStatisticsEntity[],
+    range: TimestampRange,
+    fetchedAt: number,
+  ) {
+    if (!isLiveStatisticsRange(range, entity.period, fetchedAt)) return;
+    const latest = history.reduce<CachedStatisticsEntity | undefined>(
+      (last, row) => (!last || +row.x > +last.x ? row : last),
+      undefined,
+    );
+    const end = latest ? +new Date(latest.statistics.end) : NaN;
+    // Completed buckets are stable, but their missing successors are not.
+    // Calendar aggregates may still be partial at rollover if the final
+    // hourly row has not been published yet.
+    const complete = entity.period === "5minute" || entity.period === "hour";
+    const from = latest
+      ? complete && Number.isFinite(end) && end > +latest.x && end <= fetchedAt
+        ? end
+        : +latest.x
+      : range[0];
+    this.mutableStatistics[getEntityKey(entity)] = {
+      from,
+      fetchedAt,
+      period: entity.period,
+    };
+  }
 
   private enqueue<T>(job: () => Promise<T>): Promise<T> {
     const result = this.busy.catch(() => {}).then(job);
@@ -179,24 +274,51 @@ export default class Cache {
     return result;
   }
 
-  add(entity: FetchConfig, states: CachedEntity[], range: [number, number]) {
+  add(entity: FetchConfig, states: CachedEntity[], range?: [number, number]) {
     const entityKey = getEntityKey(entity);
     let h = (this.histories[entityKey] ??= []);
-    h.push(...states);
-    h.sort((a, b) => +a.x - +b.x);
-    if (!isEntityIdStatisticsConfig(entity)) {
-      h = h.filter((x, i) => i == 0 || !x.fake_boundary_datapoint);
+    const isStatistics = isEntityIdStatisticsConfig(entity);
+    // A newer single sample cannot disturb the sorted, deduplicated history.
+    const canAppend =
+      states.length === 1 &&
+      h.length > 0 &&
+      +states[0].x > +h[h.length - 1].x &&
+      (!states[0].fake_boundary_datapoint || isStatistics);
+    // Shared attribute traces can add the same state twice. The merge keeps
+    // the existing history sample, but the fetched range still needs recording.
+    const canSkip =
+      states.length === 1 &&
+      h.length > 0 &&
+      !isStatistics &&
+      !states[0].fake_boundary_datapoint &&
+      +states[0].x === +h[h.length - 1].x;
+    if (canAppend) {
+      h.push(states[0]);
+    } else if (!canSkip) {
+      for (const state of states) h.push(state);
+      h.sort((a, b) => +a.x - +b.x);
+      if (!isStatistics) {
+        h = h.filter((x, i) => i == 0 || !x.fake_boundary_datapoint);
+      }
+      // Refetched aggregates can change without changing their bucket timestamp.
+      h = isStatistics
+        ? h.filter((_, i) => +h[i].x !== +h[i + 1]?.x)
+        : h.filter((_, i) => +h[i - 1]?.x !== +h[i].x);
+      this.histories[entityKey] = h;
     }
-    h = h.filter((_, i) => +h[i - 1]?.x !== +h[i].x);
-    this.histories[entityKey] = h;
-    this.ranges[entityKey] ??= [];
-    this.ranges[entityKey].push(range);
-    this.ranges[entityKey] = compactRanges(this.ranges[entityKey]);
+    // Frontend snapshots add a point, not evidence of complete history coverage.
+    if (range) {
+      this.ranges[entityKey] ??= [];
+      this.ranges[entityKey].push(range);
+      this.ranges[entityKey] = compactRanges(this.ranges[entityKey]);
+    }
   }
 
   clearCache() {
     this.ranges = {};
     this.histories = {};
+    this.mutableStatistics = {};
+    this.mutableHistory = {};
   }
 
   getData(entity: FetchConfig, ranges?: TimestampRange[]): EntityData {
@@ -205,34 +327,108 @@ export default class Cache {
     const history = ranges
       ? selectHistory(cachedHistory, ranges)
       : cachedHistory;
-    const data: EntityData = {
-      xs: [],
-      ys: [],
-      states: [],
-      statistics: [],
-    };
-    data.xs = history.map(({ x }) => x);
+    const data: EntityData = { xs: [], ys: [], states: [], statistics: [] };
+    // see https://github.com/dbuezas/lovelace-plotly-graph-card/issues/146
+    // and https://github.com/dbuezas/lovelace-plotly-graph-card/commit/3d915481002d03011bcc8409c2dcc6e6fb7c8674#r94899109
+    const clean = (y) =>
+      y === "unavailable" || y === "none" || y === "unknown" ? null : y;
     if (isEntityIdStatisticsConfig(entity)) {
-      data.statistics = (history as CachedStatisticsEntity[]).map(
-        ({ statistics }) => statistics
-      );
-      data.ys = data.statistics.map((s) => s[entity.statistic]);
-    } else if (isEntityIdAttrConfig(entity)) {
-      data.states = (history as CachedStateEntity[]).map(({ state }) => state);
-      data.ys = data.states.map((s) => s.attributes[entity.attribute]);
-    } else if (isEntityIdStateConfig(entity)) {
-      data.states = (history as CachedStateEntity[]).map(({ state }) => state);
-      data.ys = data.states.map((s) => s.state);
+      for (const { x, statistics } of history as CachedStatisticsEntity[]) {
+        data.xs.push(x);
+        data.statistics.push(statistics);
+        data.ys.push(clean(statistics[entity.statistic]));
+      }
+    } else if (isEntityIdAttrConfig(entity) || isEntityIdStateConfig(entity)) {
+      const attribute = isEntityIdAttrConfig(entity) ? entity.attribute : null;
+      for (const { x, state } of history as CachedStateEntity[]) {
+        data.xs.push(x);
+        data.states.push(state);
+        data.ys.push(
+          clean(attribute === null ? state.state : state.attributes[attribute]),
+        );
+      }
     } else
       throw new Error(
-        `Unrecognised fetch type for ${(entity as EntityConfig).entity}`
+        `Unrecognised fetch type for ${(entity as EntityConfig).entity}`,
       );
-    data.ys = data.ys.map((y) =>
-      // see https://github.com/dbuezas/lovelace-plotly-graph-card/issues/146
-      // and https://github.com/dbuezas/lovelace-plotly-graph-card/commit/3d915481002d03011bcc8409c2dcc6e6fb7c8674#r94899109
-      y === "unavailable" || y === "none" || y === "unknown" ? null : y
-    );
     return data;
+  }
+
+  async prefetchHistory(
+    requests: HistoryFetchRequest[],
+    hass: HomeAssistant,
+    fetchTime = Date.now(),
+  ): Promise<void> {
+    await this.enqueue(async () => {
+      const jobs = new Map<
+        string,
+        {
+          entity: HistoryFetchConfig;
+          range: [number, number];
+        }
+      >();
+      for (const request of requests) {
+        const range = request.range.map((n) =>
+          Math.max(MIN_SAFE_TIMESTAMP, n),
+        ) as [number, number];
+        const entityKey = getEntityKey(request.entity);
+        this.refreshHistory(request.entity, fetchTime);
+        this.ranges[entityKey] ??= [];
+        for (const missingRange of subtractRanges(
+          [range],
+          this.ranges[entityKey],
+        )) {
+          const jobKey = `${entityKey}:${missingRange[0]}:${missingRange[1]}`;
+          jobs.set(jobKey, {
+            entity: request.entity,
+            range: missingRange as [number, number],
+          });
+        }
+      }
+
+      const groups = new Map<
+        string,
+        {
+          dates: [Date, Date];
+          range: [number, number];
+          jobs: {
+            entity: HistoryFetchConfig;
+            range: [number, number];
+          }[];
+        }
+      >();
+      const now = Date.now();
+      for (const job of jobs.values()) {
+        const apiRange = getFetchRange(job.range, now);
+        const includeAttributes = isEntityIdAttrConfig(job.entity);
+        const groupKey = `${includeAttributes}:${+apiRange.dates[0]}:${+apiRange.dates[1]}`;
+        const group = groups.get(groupKey) ?? {
+          dates: apiRange.dates,
+          range: apiRange.range,
+          jobs: [],
+        };
+        group.jobs.push(job);
+        groups.set(groupKey, group);
+      }
+
+      for (const group of groups.values()) {
+        const statesByEntity = await fetchStatesBatch(
+          hass,
+          group.jobs.map(({ entity }) => entity),
+          group.dates,
+        );
+        for (const { entity, range } of group.jobs) {
+          const history = statesByEntity[entity.entity] ?? [];
+          if (history.length && +history[0].x <= +group.dates[0])
+            history[0].fake_boundary_datapoint = true;
+          this.add(entity, history, [
+            range[0],
+            Math.min(range[1], group.range[1]),
+          ]);
+          this.trackMutableHistory(entity, history, group.range, fetchTime);
+        }
+      }
+    });
   }
 
   retain(retainedRanges: Record<string, TimestampRange[]>) {
@@ -243,6 +439,8 @@ export default class Cache {
     for (const key of keys) {
       const ranges = compactRanges(retainedRanges[key] || []);
       if (ranges.length === 0) {
+        delete this.mutableStatistics[key];
+        delete this.mutableHistory[key];
         delete this.histories[key];
         delete this.ranges[key];
         continue;
@@ -255,9 +453,9 @@ export default class Cache {
   async prefetchStatistics(
     requests: {
       range: TimestampRange;
-      entity: EntityIdStatisticsConfig;
+      entity: StatisticsFetchConfig;
     }[],
-    hass: HomeAssistant
+    hass: HomeAssistant,
   ): Promise<void> {
     await this.enqueue(async () => {
       const now = Date.now();
@@ -266,7 +464,7 @@ export default class Cache {
         {
           dates: [Date, Date];
           range: [number, number];
-          entities: Map<string, EntityIdStatisticsConfig>;
+          entities: Map<string, StatisticsFetchConfig>;
         }
       >();
 
@@ -279,7 +477,7 @@ export default class Cache {
         for (const missingRange of rangesToFetch) {
           const { dates, range: fetchedRange } = getFetchRange(
             missingRange,
-            now
+            now,
           );
           const groupKey = JSON.stringify([
             request.entity.period,
@@ -304,6 +502,12 @@ export default class Cache {
         const histories = await fetchStatistics(hass, entities, group.dates);
         for (const entity of entities) {
           this.add(entity, histories[entity.entity], group.range);
+          this.trackMutableStatistics(
+            entity,
+            histories[entity.entity],
+            group.range,
+            now,
+          );
         }
       }
     });
@@ -313,17 +517,35 @@ export default class Cache {
     range: TimestampRange,
     entity: FetchConfig,
     hass: HomeAssistant,
-    dataRanges: TimestampRange[] = [range]
+    dataRanges: TimestampRange[] = [range],
+    fetchTime = Date.now(),
   ) {
     return this.enqueue(async () => {
       range = range.map((n) => Math.max(MIN_SAFE_TIMESTAMP, n)); // HA API can't handle negative years
       if (entity.entity) {
         const entityKey = getEntityKey(entity);
+        if (!isEntityIdStatisticsConfig(entity))
+          this.refreshHistory(entity, fetchTime);
         this.ranges[entityKey] ??= [];
         const rangesToFetch = subtractRanges([range], this.ranges[entityKey]);
         for (const aRange of rangesToFetch) {
           const fetchedHistory = await fetchSingleRange(hass, entity, aRange);
           this.add(entity, fetchedHistory.history, fetchedHistory.range);
+          if (isEntityIdStatisticsConfig(entity)) {
+            this.trackMutableStatistics(
+              entity,
+              fetchedHistory.history as CachedStatisticsEntity[],
+              fetchedHistory.range,
+              fetchedHistory.fetchedAt,
+            );
+          } else {
+            this.trackMutableHistory(
+              entity,
+              fetchedHistory.history,
+              fetchedHistory.range,
+              fetchTime,
+            );
+          }
         }
       }
       return this.getData(entity, dataRanges);

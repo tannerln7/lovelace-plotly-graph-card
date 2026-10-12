@@ -4,6 +4,7 @@ import {
 } from "./parse-config/parse-color-scheme";
 
 import { RelativeTimeStr, TimeDurationStr } from "./duration/duration";
+import { EntityName } from "./entity-name";
 import {
   AutoPeriodConfig,
   StatisticPeriod,
@@ -13,21 +14,21 @@ import {
 
 import { HassEntity } from "home-assistant-js-websocket";
 import { FilterFn, FilterInput } from "./filters/filters";
-import type filters from "./filters/filters";
-import internal from "stream";
 
-export { HassEntity } from "home-assistant-js-websocket";
+export type { HassEntity } from "home-assistant-js-websocket";
 
 export type YValue = number | string | null;
 
 export type InputEntityOptions = {
   entity?: string;
-  name?: string;
+  /** A plain string, or name parts resolved from the entity's registry context. */
+  name?: EntityName;
   attribute?: string;
   statistic?: StatisticType;
   period?: StatisticPeriod | "auto" | AutoPeriodConfig;
   unit_of_measurement?: string;
   internal?: boolean;
+  show_extrema?: boolean;
   show_value?:
     | boolean
     | {
@@ -40,6 +41,12 @@ export type InputEntityOptions = {
   on_legend_click?: Function;
   on_legend_dblclick?: Function;
   on_click?: Function;
+};
+
+export type TouchGestures = {
+  pinch_to_zoom: boolean;
+  double_tap_drag_to_zoom: boolean;
+  hold_to_scan: boolean;
 };
 
 export type InputConfig = {
@@ -62,6 +69,16 @@ export type InputConfig = {
   refresh_interval?: number | "auto"; // in seconds
   color_scheme?: ColorSchemeNames | ColorSchemeArray | number;
   title?: string;
+  /** Main y-axis minimum in data units, set by the visual editor. */
+  min_y_axis?: number;
+  /** Main y-axis maximum in data units, set by the visual editor. */
+  max_y_axis?: number;
+  /** Expand the main y-axis to include both data and editor bounds. */
+  fit_y_data?: boolean;
+  /** Use a logarithmic main y-axis unless a Plotly axis type is specified. */
+  logarithmic_scale?: boolean;
+  /** Align zero on automatically scaled, overlaid linear Y-axes. */
+  align_zero?: boolean;
   offset?: TimeDurationStr;
   entities: (InputEntityOptions & Partial<Plotly.Data>)[];
   defaults?: {
@@ -76,15 +93,23 @@ export type InputConfig = {
   raw_plotly_config?: boolean;
   significant_changes_only?: boolean; // defaults to false
   minimal_response?: boolean; // defaults to true
-  disable_pinch_to_zoom?: boolean; // defaults to false
-  touch_hover?: boolean; // defaults to false
+  extended_touch_support?: boolean | Partial<TouchGestures>; // defaults to true
+  disable_pinch_to_zoom?: boolean; // old, same as extended_touch_support: false
+  touch_hover?: boolean; // custom touch refactor; default false
   autorange_after_scroll?: boolean; // defaults to false
   preset?: string | string[];
+  /**
+   * Timezone the x axis is drawn in: "local" (the browser's), "server"
+   * (Home Assistant's), or an IANA name like "Europe/Rome".
+   * Defaults to the Home Assistant user profile setting.
+   */
+  time_zone?: string;
 };
 
 export type EntityConfig = EntityIdConfig & {
   unit_of_measurement?: string;
   internal: boolean;
+  show_extrema?: boolean;
   show_value:
     | boolean
     | {
@@ -100,7 +125,16 @@ export type EntityConfig = EntityIdConfig & {
 
 export type Config = {
   title?: string;
+  min_y_axis?: number;
+  max_y_axis?: number;
+  fit_y_data?: boolean;
+  logarithmic_scale?: boolean;
+  align_zero?: boolean;
   hours_to_show: number;
+  editor_y_axis?: {
+    partial_bound?: boolean;
+    log_fit_bounds?: [number | null, number | null];
+  };
   refresh_interval: number | "auto"; // in seconds
   offset: number;
   entities: EntityConfig[];
@@ -110,11 +144,13 @@ export type Config = {
   raw_plotly_config: boolean;
   significant_changes_only: boolean;
   minimal_response: boolean;
+  extended_touch_support?: boolean | Partial<TouchGestures>;
   disable_pinch_to_zoom: boolean;
   touch_hover: boolean;
   visible_range: [number, number];
   on_dblclick: Function;
   autorange_after_scroll: boolean;
+  time_zone?: string; // "local", "server" or an IANA name
 };
 export type EntityIdStateConfig = {
   entity: string;
@@ -127,6 +163,10 @@ export type EntityIdStatisticsConfig = {
   entity: string;
   statistic: StatisticType;
   period: StatisticPeriod;
+};
+export type StatisticsFetchConfig = EntityIdStatisticsConfig & {
+  // One sorted, unique field selection shared by every trace in a parser update.
+  types?: StatisticType[];
 };
 export type EntityIdConfig =
   | EntityIdStateConfig
@@ -161,6 +201,7 @@ export type CachedBaseEntity = {
 };
 export type CachedStateEntity = CachedBaseEntity & {
   state: HassEntity;
+  unconfirmed?: true;
 };
 export type CachedStatisticsEntity = CachedBaseEntity & {
   statistics: StatisticValue;

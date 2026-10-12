@@ -1,4 +1,4 @@
-import Plotly from "../../plotly";
+import type Plotly from "../../plotly";
 import type { ClientPoint } from "../contracts";
 
 declare const plotlyTouchSurfaceBrand: unique symbol;
@@ -61,7 +61,6 @@ interface NativeObservationRecord {
   latestRelayoutUpdate?: Plotly.PlotRelayoutEvent;
 }
 
-const plotlyFx = (Plotly as unknown as { Fx: PlotlyFxApi }).Fx;
 const cloneRelayoutUpdate = (
   update: Plotly.PlotRelayoutEvent,
 ): Plotly.PlotRelayoutEvent =>
@@ -69,6 +68,7 @@ const cloneRelayoutUpdate = (
 
 export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
   private readonly root: ObservedPlotlyRoot;
+  private plotly?: typeof import("../../plotly").default;
   private readonly leases = new WeakMap<
     NativeGestureObservation,
     NativeObservationRecord | null
@@ -78,6 +78,21 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
 
   constructor(root: Plotly.PlotlyHTMLElement) {
     this.root = root as ObservedPlotlyRoot;
+  }
+
+  // The card supplies the Plotly instance after its dynamic import completes.
+  setPlotly(plotly: typeof import("../../plotly").default): void {
+    this.plotly = plotly;
+  }
+
+  private get runtime(): typeof import("../../plotly").default {
+    if (!this.plotly)
+      throw new Error("Plotly touch adapter is not initialized");
+    return this.plotly;
+  }
+
+  private get fx(): PlotlyFxApi {
+    return (this.runtime as unknown as { Fx: PlotlyFxApi }).Fx;
   }
 
   resolveSurface(touch: Touch): PlotlyTouchSurface | undefined {
@@ -143,7 +158,7 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
       },
       0,
     );
-    void Plotly.relayout(this.root, update);
+    void this.runtime.relayout(this.root, update);
     return true;
   }
 
@@ -159,7 +174,7 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
     const hovermode =
       configuredMode && configuredMode !== "closest" ? configuredMode : "x";
     this.customHoverVisible = true;
-    plotlyFx.hover(
+    this.fx.hover(
       this.root,
       {
         clientX: point.clientX,
@@ -173,7 +188,7 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
 
   clearHover(): void {
     this.customHoverVisible = false;
-    if (this.root._fullLayout) plotlyFx.unhover(this.root);
+    if (this.root._fullLayout && this.plotly) this.fx.unhover(this.root);
   }
 
   reconcileNativeTouchEnd(): void {
@@ -182,8 +197,8 @@ export class PlotlyTouchAdapter implements PlotlyTouchAdapterContract {
     const afterNativeCompletion = (): void => {
       // Plotly handles touchend at document level after root capture. Do not
       // let this deferred cleanup erase a newer custom hover.
-      if (!this.customHoverVisible && this.root._fullLayout) {
-        plotlyFx.unhover(this.root);
+      if (!this.customHoverVisible && this.root._fullLayout && this.plotly) {
+        this.fx.unhover(this.root);
       }
     };
     const view = this.root.ownerDocument.defaultView;

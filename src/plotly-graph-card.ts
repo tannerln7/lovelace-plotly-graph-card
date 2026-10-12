@@ -1,57 +1,111 @@
+import "./global-shim";
 import { HomeAssistant } from "custom-card-helpers";
 import EventEmitter from "events";
-import mapValues from "lodash/mapValues";
 import { version } from "../package.json";
-import insertStyleHack from "./style-hack";
-import Plotly from "./plotly";
+import copyPlotlyStyles from "./style-hack";
 import {
   Config,
   InputConfig,
   isEntityIdAttrConfig,
   isEntityIdStateConfig,
-  isEntityIdStatisticsConfig,
 } from "./types";
 import isProduction from "./is-production";
 import "./hot-reload";
-import { debounce, sleep } from "./utils";
+import { debounce, Delay, liveThrottle, sleep } from "./utils";
 import { parseISO } from "date-fns";
-import { PlotlyTouchAdapter, TouchController } from "./touch";
+import { TouchController, PlotlyTouchAdapter } from "./touch";
 import { ConfigParser } from "./parse-config/parse-config";
-import { merge } from "lodash";
+import merge from "lodash/merge";
+import {
+  DEFAULT_PLOT_HEIGHT,
+  finishInitialLoading,
+  setInitialLoadingHeight,
+} from "./loading-state";
+import { readThemeColors } from "./parse-config/themed-layout";
 import { getFetchMask } from "./plot-state";
+import { inTimeZone } from "./timezone";
+import { getEditorYAxisRelayout } from "./parse-config/defaults";
+import { prepareHistoryLineGaps } from "./history-line-gaps";
+import { StatisticsUpdates } from "./statistics-updates";
+import { HistoryUpdates } from "./history-updates";
+import { getEntityKey } from "./cache/Cache";
+import { mapStates } from "./cache/fetch-states";
+import type { StatisticsUpdatePeriod } from "./cache/statistics-refresh";
+import {
+  getZeroAlignmentProtectedAxes,
+  getZeroAlignmentRelayout,
+} from "./zero-alignment";
 
 const componentName = isProduction ? "plotly-graph" : "plotly-graph-dev";
 
 console.info(
   `%c ${componentName.toUpperCase()} %c ${version} ${process.env.NODE_ENV}`,
   "color: orange; font-weight: bold; background: black",
-  "color: white; font-weight: bold; background: dimgray"
+  "color: white; font-weight: bold; background: dimgray",
 );
 
 export class PlotlyGraph extends HTMLElement {
   contentEl: Plotly.PlotlyHTMLElement & {
     data: (Plotly.Data & { entity: string })[];
     layout: Plotly.Layout;
+    _fullLayout: Plotly.Layout;
+    _fullData: { yaxis?: string; visible?: unknown; y?: readonly unknown[] }[];
   };
   errorMsgEl: HTMLElement;
+  plotlyStyleEl: HTMLStyleElement;
   cardEl: HTMLElement;
   resetButtonEl: HTMLButtonElement;
   titleEl: HTMLElement;
+  loadingEl: HTMLElement;
   config!: InputConfig;
   parsed_config!: Config;
   size: { width?: number; height?: number } = {};
+  // Home Assistant sets this property; reflect it for the layout height styles.
+  get layout() {
+    return this.getAttribute("layout") ?? undefined;
+  }
+  set layout(value: string | undefined) {
+    if (value === undefined) this.removeAttribute("layout");
+    else this.setAttribute("layout", value);
+  }
   _hass?: HomeAssistant;
   isBrowsing = false;
   isInternalRelayout = 0;
   plotlyListenersConnected = false;
   touchController: TouchController;
+  touchAdapter: PlotlyTouchAdapter;
   configParser = new ConfigParser();
+  private statisticsFetchPeriods = new Set<StatisticsUpdatePeriod>();
+  statisticsUpdates = new StatisticsUpdates((period) => {
+    this.statisticsFetchPeriods.add(period);
+    void this.plot({ should_fetch: false }, 500);
+  });
+  historyUpdates = new HistoryUpdates((states, start) => {
+    let changed = false;
+    for (const entity of this.configParser.historyEntities) {
+      const history = mapStates(entity.entity, states[entity.entity]);
+      if (!history.length) continue;
+      // The stream is complete from its start, including intervals with no changes.
+      this.configParser.cache.add(entity, history, [
+        Math.min(start, +history[0].x),
+        +history.at(-1)!.x,
+      ]);
+      changed = true;
+    }
+    if (changed)
+      void this.plot({ should_fetch: false }, this.liveThrottle.change());
+  });
   pausedRendering = false;
+  // Initial setup may run before attachment; only removal cancels it.
+  private disconnected = false;
+  filesFailed = false; // the browser remembers failed imports until a reload
   handles: {
     resizeObserver?: ResizeObserver;
+    intersectionObserver?: IntersectionObserver;
     relayoutListener?: EventEmitter;
     restyleListener?: EventEmitter;
     refreshTimeout?: number;
+    offScreenTimeout?: number;
     legendItemClick?: EventEmitter;
     legendItemDoubleclick?: EventEmitter;
     dataClick?: EventEmitter;
@@ -69,17 +123,99 @@ export class PlotlyGraph extends HTMLElement {
     }
     const shadow = this.attachShadow({ mode: "open" });
     shadow.innerHTML = `
-        <ha-card>
+        <ha-card class="loading" aria-busy="true">
           <style>
+            :host {
+              display: block;
+            }
+            :host([layout="panel"]),
+            :host([layout="grid"]) {
+              height: 100%;
+            }
             ha-card{
+              display: block;
               overflow: hidden;
+              position: relative;
               background: transparent;
               width: 100%;
               height: calc(100% - 5px);
               direction: ltr;
             }
+            ha-card.loading {
+              background: var(
+                --ha-card-background,
+                var(--card-background-color, var(--primary-background-color))
+              );
+              height: auto;
+              min-height: var(--plotly-loading-height, ${DEFAULT_PLOT_HEIGHT}px);
+            }
+            :host([layout="panel"]) ha-card.loading,
+            :host([layout="grid"]) ha-card.loading {
+              height: calc(100% - 5px);
+              min-height: 0;
+            }
             ha-card > #plotly{
               width: 100px;
+            }
+            ha-card.loading > #plotly{
+              min-height: var(--plotly-loading-height, ${DEFAULT_PLOT_HEIGHT}px);
+              max-height: var(--plotly-loading-height, ${DEFAULT_PLOT_HEIGHT}px);
+            }
+            #loading {
+              position: absolute;
+              inset: 0;
+              display: none;
+              align-items: center;
+              justify-content: center;
+              pointer-events: none;
+            }
+            ha-card.loading > #loading {
+              display: flex;
+            }
+            #loading::before {
+              content: "";
+              position: absolute;
+              left: 27.5%;
+              width: 45%;
+              height: 1px;
+              background: var(--divider-color, rgba(127, 127, 127, 0.25));
+            }
+            #loading::after {
+              content: "";
+              position: absolute;
+              left: 27.5%;
+              width: 9%;
+              height: 2px;
+              border-radius: 2px;
+              background: linear-gradient(
+                90deg,
+                transparent,
+                var(--primary-color) 75%,
+                var(--primary-color)
+              );
+              filter: drop-shadow(0 0 2px var(--primary-color));
+              animation: plotly-card-loading 2.2s ease-in-out infinite;
+            }
+            @keyframes plotly-card-loading {
+              0% {
+                opacity: 0;
+                transform: translateX(-100%);
+              }
+              15%,
+              85% {
+                opacity: 1;
+              }
+              100% {
+                opacity: 0;
+                transform: translateX(400%);
+              }
+            }
+            @media (prefers-reduced-motion: reduce) {
+              #loading::after {
+                animation: none;
+                opacity: 0.8;
+                transform: translateX(180%);
+              }
             }
             ha-card > #title{
               text-align: center;
@@ -113,12 +249,17 @@ export class PlotlyGraph extends HTMLElement {
               overflow-wrap: break-word;
               display: none;
             }
+            /* No chart (e.g. files didn't load): don't overlay, take space */
+            ha-card:not(:has(.plot-container)) > #error-msg {
+              position: static;
+            }
             #error-msg a{
               color: mediumturquoise;
             }
           </style>
           <div id="title"> </div>
           <div id="plotly"> </div>
+          <div id="loading" role="status" aria-label="Loading graph"></div>
           <span id="error-msg"> </span>
           <button id="reset" class="hidden">↻</button>
         </ha-card>`;
@@ -127,88 +268,111 @@ export class PlotlyGraph extends HTMLElement {
     this.contentEl = shadow.querySelector("div#plotly")!;
     this.resetButtonEl = shadow.querySelector("button#reset")!;
     this.titleEl = shadow.querySelector("ha-card > #title")!;
-    insertStyleHack(shadow.querySelector("style")!);
+    this.loadingEl = shadow.querySelector("#loading")!;
+    this.plotlyStyleEl = shadow.appendChild(document.createElement("style"));
     this.contentEl.style.visibility = "hidden";
+    this.touchAdapter = new PlotlyTouchAdapter(this.contentEl);
     this.touchController = new TouchController({
       root: this.contentEl,
-      plotly: new PlotlyTouchAdapter(this.contentEl),
+      plotly: this.touchAdapter,
       onGestureStart: () => {
         this.pausedRendering = true;
       },
       onGestureEnd: () => {
         this.pausedRendering = false;
-        this.plot({ should_fetch: true });
+        if (this.isConnected) void this.plot({ should_fetch: true });
       },
     });
   }
 
-  connectedCallback() {
-    const updateCardSize = async () => {
-      const width = this.cardEl.offsetWidth;
-      this.contentEl.style.position = "absolute";
-      const height = this.cardEl.offsetHeight;
-      this.contentEl.style.position = "";
-      this.size = { width };
-      if (height > 100) {
-        // Panel view type has the cards covering 100% of the height of the window.
-        // Masonry lets the cards grow by themselves.
-        // if height > 100 ==> Panel ==> use available height
-        // else ==> Mansonry ==> let the height be determined by defaults
-        this.size.height = height - this.titleEl.offsetHeight;
-      }
-      this.plot({ should_fetch: false });
-    };
-    this.handles.resizeObserver = new ResizeObserver(updateCardSize);
-    this.handles.resizeObserver.observe(this.cardEl);
+  updateCardSize = () => {
+    const width = this.cardEl.offsetWidth;
+    if (width <= 0) return;
+    this.contentEl.style.position = "absolute";
+    const height = this.cardEl.offsetHeight;
+    this.contentEl.style.position = "";
+    const nextSize: { width: number; height?: number } = { width };
+    if (height > 100) {
+      // Excluding the plot leaves the allocated height in panel/grid layouts,
+      // or only the title in auto-height layouts, which use the default height.
+      nextSize.height = height - this.titleEl.offsetHeight;
+    }
+    if (
+      this.size.width === nextSize.width &&
+      this.size.height === nextSize.height
+    )
+      return;
+    this.size = nextSize;
+    void this.plot({ should_fetch: false });
+  };
 
-    updateCardSize();
+  connectedCallback() {
+    this.disconnected = false;
+    this.handles.intersectionObserver = new IntersectionObserver(([entry]) => {
+      this.onScreen = entry.isIntersecting;
+      if (this.onScreen) this.catchUp();
+    });
+    this.handles.intersectionObserver.observe(this.cardEl);
+    this.handles.resizeObserver = new ResizeObserver(this.updateCardSize);
+    this.handles.resizeObserver.observe(this.cardEl);
+    this.handles.resizeObserver.observe(this.titleEl);
+
+    this.updateCardSize();
     this.resetButtonEl.addEventListener("click", this.exitBrowsingMode);
     this.touchController.connect();
-    this.plot({ should_fetch: true });
+    this.updateStatisticsSubscriptions();
+    // Start downloading Plotly while the data is fetched (errors show on render)
+    import("./plotly").catch(() => {});
+    void this.plot({ should_fetch: true, refresh_statistics: true });
   }
 
   disconnectedCallback() {
+    this.disconnected = true;
     this.handles.resizeObserver?.disconnect();
+    this.handles.intersectionObserver?.disconnect();
     this.disconnectPlotlyListeners();
     clearTimeout(this.handles.refreshTimeout!);
+    clearTimeout(this.handles.offScreenTimeout);
     this.resetButtonEl.removeEventListener("click", this.exitBrowsingMode);
     this.touchController.disconnect();
+    this.statisticsUpdates.disconnect();
+    this.historyUpdates.disconnect();
   }
 
   connectPlotlyListeners() {
     if (this.plotlyListenersConnected) return;
     this.handles.relayoutListener = this.contentEl.on(
       "plotly_relayout",
-      this.onRelayout
+      this.onRelayout,
     )!;
     this.handles.restyleListener = this.contentEl.on(
       "plotly_restyle",
-      this.onRestyle
+      this.onRestyle,
     )!;
     this.handles.legendItemClick = this.contentEl.on(
       "plotly_legendclick",
-      this.onLegendItemClick
+      this.onLegendItemClick,
     )!;
     this.handles.legendItemDoubleclick = this.contentEl.on(
       "plotly_legenddoubleclick",
-      this.onLegendItemDoubleclick
+      this.onLegendItemDoubleclick,
     )!;
     this.handles.dataClick = this.contentEl.on(
       "plotly_click",
-      this.onDataClick
+      this.onDataClick,
     )!;
     this.handles.doubleclick = this.contentEl.on(
       "plotly_doubleclick",
-      this.onDoubleclick
+      this.onDoubleclick,
     )!;
     this.handles.annotationClick = this.contentEl.on(
       "plotly_clickannotation",
-      this.onAnnotationClick
+      this.onAnnotationClick,
     )!;
     this.handles.buttonClick = this.contentEl.on(
       // @ts-ignore Not properly typed in @types/plotly.js
       "plotly_buttonclicked",
-      this.onButtonClick
+      this.onButtonClick,
     )!;
     this.plotlyListenersConnected = true;
   }
@@ -219,15 +383,18 @@ export class PlotlyGraph extends HTMLElement {
     this.handles.restyleListener?.off("plotly_restyle", this.onRestyle);
     this.handles.legendItemClick?.off(
       "plotly_legendclick",
-      this.onLegendItemClick
+      this.onLegendItemClick,
     );
     this.handles.legendItemDoubleclick?.off(
       "plotly_legenddoubleclick",
-      this.onLegendItemDoubleclick
+      this.onLegendItemDoubleclick,
     );
     this.handles.dataClick?.off("plotly_click", this.onDataClick);
     this.handles.doubleclick?.off("plotly_doubleclick", this.onDoubleclick);
-    this.handles.annotationClick?.off("plotly_clickannotation", this.onAnnotationClick);
+    this.handles.annotationClick?.off(
+      "plotly_clickannotation",
+      this.onAnnotationClick,
+    );
     this.handles.buttonClick?.off("plotly_buttonclicked", this.onButtonClick);
     this.plotlyListenersConnected = false;
   }
@@ -242,38 +409,62 @@ export class PlotlyGraph extends HTMLElement {
     }
     if (this.parsed_config?.refresh_interval === "auto") {
       let shouldPlot = false;
-      let should_fetch = false;
       for (const entity of this.parsed_config.entities) {
         const state = hass.states[entity.entity];
         const oldState = this._hass?.states[entity.entity];
         if (state && oldState !== state) {
           shouldPlot = true;
-          const start = new Date(oldState?.last_updated || state.last_updated);
           const end = new Date(state.last_updated);
-          const range: [number, number] = [+start, +end];
-          let shouldAddToCache = false;
-          if (isEntityIdAttrConfig(entity)) {
-            shouldAddToCache = true;
-          } else if (isEntityIdStateConfig(entity)) {
-            shouldAddToCache = true;
-          } else if (isEntityIdStatisticsConfig(entity)) {
-            should_fetch = true;
-          }
-
-          if (shouldAddToCache) {
-            this.configParser.cache.add(
-              entity,
-              [{ state, x: new Date(end), y: null }],
-              range
-            );
+          if (
+            (isEntityIdAttrConfig(entity) || isEntityIdStateConfig(entity)) &&
+            !this.historyUpdates.has(entity.entity)
+          ) {
+            this.configParser.cache.add(entity, [
+              { state, x: new Date(end), y: null, unconfirmed: true },
+            ]);
           }
         }
       }
       if (shouldPlot) {
-        this.plot({ should_fetch }, 500);
+        void this.plot({ should_fetch: false }, this.liveThrottle.change());
       }
     }
     this._hass = hass;
+    this.updateStatisticsSubscriptions();
+  }
+
+  updateStatisticsSubscriptions() {
+    this.statisticsUpdates.update(
+      this.hass?.connection,
+      this.isConnected && this.parsed_config?.refresh_interval === "auto"
+        ? this.configParser.statisticsPeriods
+        : new Set(),
+    );
+    const entities =
+      this.isConnected && this.parsed_config?.refresh_interval === "auto"
+        ? this.configParser.historyEntities
+        : [];
+    this.historyUpdates.update(
+      this.hass?.connection,
+      entities.map((entity) => entity.entity),
+      entities.some(isEntityIdAttrConfig),
+      (entityId) =>
+        Math.min(
+          ...entities
+            .filter((entity) => entity.entity === entityId)
+            .map((entity) => {
+              const key = getEntityKey(entity);
+              const cache = this.configParser.cache;
+              const history = cache.histories[key] ?? [];
+              for (let index = history.length - 1; index >= 0; index--) {
+                const row = history[index];
+                if (!("unconfirmed" in row && row.unconfirmed))
+                  return row.x.getTime();
+              }
+              return cache.ranges[key]?.[0]?.[0] ?? Date.now();
+            }),
+        ),
+    );
   }
 
   async withoutRelayout(fn: Function) {
@@ -286,6 +477,10 @@ export class PlotlyGraph extends HTMLElement {
   }
 
   getVisibleRange() {
+    // Plotly hands back the wall clock times it was given, in the card's time
+    // zone. Known issue: with @date-fns/tz 1.5, a time inside a DST gap of the
+    // browser's own zone comes back shifted (https://github.com/date-fns/tz/pull/79)
+    const options = inTimeZone(this.configParser.timeZone);
     // TODO: if the x axis is not there, or is not time, don't fetch & replot
     return this.contentEl.layout.xaxis?.range?.map((date) => {
       // if autoscale is used after scrolling, plotly returns the dates as timestamps (numbers) instead of iso strings
@@ -303,10 +498,11 @@ export class PlotlyGraph extends HTMLElement {
          timestamp = 2 * (year 0) - (-date)
         */
         return (
-          2 * +parseISO("0000-01-01 00:00:00.000") - +parseISO(date.slice(1))
+          2 * +parseISO("0000-01-01 00:00:00.000", options) -
+          +parseISO(date.slice(1), options)
         );
       }
-      return +parseISO(date);
+      return +parseISO(date, options);
     });
   }
   enterBrowsingMode = () => {
@@ -316,9 +512,9 @@ export class PlotlyGraph extends HTMLElement {
   exitBrowsingMode = async () => {
     this.isBrowsing = false;
     this.resetButtonEl.classList.add("hidden");
-    this.withoutRelayout(async () => {
+    void this.withoutRelayout(async () => {
       this.configParser.resetObservedRange();
-      await this.plot({ should_fetch: true });
+      await this.plot({ should_fetch: true, refresh_statistics: true });
     });
   };
   onLegendItemClick = ({ curveNumber, ...rest }) => {
@@ -344,13 +540,13 @@ export class PlotlyGraph extends HTMLElement {
   };
   onAnnotationClick = ({ annotation, ...rest }) => {
     if (annotation.on_click) {
-        return annotation.on_click({ annotation, ...rest });
+      return annotation.on_click({ annotation, ...rest });
     }
     return true;
   };
   onButtonClick = ({ button, ...rest }) => {
     if (button._input.on_click) {
-        return button._input.on_click({ button, ...rest });
+      return button._input.on_click({ button, ...rest });
     }
     return true;
   };
@@ -370,121 +566,229 @@ export class PlotlyGraph extends HTMLElement {
   // The user supplied configuration. Throw an exception and Lovelace will
   // render an error card.
   async setConfig(config: InputConfig) {
-    const was = this.config;
     this.config = config;
-    this.exitBrowsingMode();
+    setInitialLoadingHeight(this.cardEl, config.layout);
+    if (this.isConnected) this.updateCardSize();
+    void this.exitBrowsingMode();
   }
   getCSSVars() {
     const styles = window.getComputedStyle(this.contentEl);
-    let haTheme = {
-      "card-background-color": "red",
-      "primary-background-color": "red",
-      "primary-color": "red",
-      "primary-text-color": "red",
-      "secondary-text-color": "red",
-    };
     const cssVar = (...names: string[]) =>
       names.map((name) => styles.getPropertyValue(name).trim()).find(Boolean);
     return {
-      ...mapValues(haTheme, (_, key) => styles.getPropertyValue("--" + key)),
+      ...readThemeColors(styles),
       // Home Assistant typography: current frontend tokens first, then the
       // legacy paper/mdc ones, then whatever the card inherits.
       "font-family":
         cssVar(
           "--ha-font-family-body",
           "--paper-font-body1_-_font-family",
-          "--mdc-typography-body1-font-family"
+          "--mdc-typography-body1-font-family",
         ) || styles.fontFamily,
       "font-size": cssVar("--ha-font-size-s") || "12px",
       "font-weight":
         cssVar(
           "--ha-font-weight-normal",
           "--paper-font-body1_-_font-weight",
-          "--mdc-typography-body1-font-weight"
+          "--mdc-typography-body1-font-weight",
         ) || "400",
     };
   }
   fetchScheduled = false;
+  private statisticsRefreshScheduled = false;
   plot = async (
-    { should_fetch }: { should_fetch: boolean },
-    delay?: number
+    {
+      should_fetch,
+      refresh_statistics = false,
+    }: {
+      should_fetch: boolean;
+      refresh_statistics?: boolean;
+    },
+    delay?: Delay,
   ) => {
-    if (should_fetch) this.fetchScheduled = true;
+    if (should_fetch || refresh_statistics) this.fetchScheduled = true;
+    if (refresh_statistics) this.statisticsRefreshScheduled = true;
     await this._plot(delay);
   };
-  _plot = debounce(async () => {
-    if (this.pausedRendering) return;
-    const should_fetch = this.fetchScheduled;
-    this.fetchScheduled = false;
-    let i = 0;
-    while (!(this.config && this.hass && this.isConnected)) {
-      if (i++ > 50) throw new Error("Card didn't load");
-      console.log("waiting for loading");
-      await sleep(100);
+  liveThrottle = liveThrottle();
+  onScreen = true;
+  renderDeferred = false;
+  lastRender = -Infinity;
+  catchUp = () => {
+    clearTimeout(this.handles.offScreenTimeout);
+    if (!this.renderDeferred) return;
+    this.renderDeferred = false;
+    void this.plot({ should_fetch: false });
+  };
+  _plot = debounce(async (now) => {
+    this.liveThrottle.renderStarted();
+    if (this.pausedRendering || this.filesFailed || this.disconnected) return;
+    // Off-screen cards update every 30 s, and catch up once scrolled into
+    // view. They still update, for full-page screenshots.
+    const wait = this.lastRender + 30_000 - performance.now();
+    if (!this.onScreen && this.parsed_config && wait > 0) {
+      this.renderDeferred = true;
+      clearTimeout(this.handles.offScreenTimeout);
+      this.handles.offScreenTimeout = window.setTimeout(this.catchUp, wait);
+      return;
     }
-    const fetch_mask = getFetchMask(this.contentEl.data, should_fetch);
-    const uirevision = this.isBrowsing
-      ? this.contentEl.layout?.uirevision || 0
-      : Math.random();
-    const yaml = merge(
-      {},
-      this.config,
-      {
-        layout: {
-          ...this.size,
-          ...{ uirevision },
-        },
-        fetch_mask,
-      },
-      this.isBrowsing ? { visible_range: this.getVisibleRange() } : {},
-
-      this.config
-    );
-    const { errors, parsed } = await this.configParser.update({
-      yaml,
-      hass: this.hass,
-      css_vars: this.getCSSVars(),
-    });
-    this.errorMsgEl.style.display = errors.length ? "block" : "none";
-    this.errorMsgEl.innerHTML = errors
-      .map((e) => "<span>" + (e || "See devtools console") + "</span>")
-      .join("\n<br />\n");
-    this.parsed_config = parsed;
-    this.touchController.isEnabled =
-      !this.parsed_config.disable_pinch_to_zoom;
-    this.touchController.touchHoverEnabled =
-      this.parsed_config.touch_hover ?? false;
-
-    const {
-      entities,
-      layout,
-      config,
-      refresh_interval,
-      autorange_after_scroll,
-    } = this.parsed_config;
-    clearTimeout(this.handles.refreshTimeout!);
-    if (refresh_interval !== "auto" && refresh_interval > 0) {
-      this.handles.refreshTimeout = window.setTimeout(
-        () => this.plot({ should_fetch: true }),
-        refresh_interval * 1000
-      );
-    }
-    this.titleEl.innerText = this.parsed_config.title || "";
-    if (layout.paper_bgcolor) {
-      this.titleEl.style.background = layout.paper_bgcolor as string;
-    }
-    await this.withoutRelayout(async () => {
-      await Plotly.react(this.contentEl, entities, layout, config);
-      if (autorange_after_scroll) {
-        const update = {
-          "yaxis.autorange": true,
-        };
-        // Plotly accepts attribute paths, but its public types only list nested keys.
-        await Plotly.relayout(this.contentEl, update as Partial<Plotly.Layout>);
+    this.lastRender = performance.now();
+    try {
+      const should_fetch = this.fetchScheduled;
+      this.fetchScheduled = false;
+      const refresh_statistics = this.statisticsRefreshScheduled;
+      this.statisticsRefreshScheduled = false;
+      const statisticsUpdates = this.statisticsFetchPeriods;
+      this.statisticsFetchPeriods = new Set();
+      let i = 0;
+      while (!(this.config && this.hass && this.isConnected)) {
+        if (this.disconnected) return;
+        if (i++ > 50) throw new Error("Card didn't load");
+        console.log("waiting for loading");
+        await sleep(100);
+        now = Date.now();
       }
-      this.contentEl.style.visibility = "";
-    });
-    if (this.isConnected) this.connectPlotlyListeners();
+      // Invalidate between parses, not while an older fetch is still running.
+      if (refresh_statistics) {
+        await this.configParser.cache.refreshStatistics(now);
+      } else {
+        for (const period of statisticsUpdates)
+          await this.configParser.cache.refreshStatistics(now, period);
+      }
+      const fetch_mask = getFetchMask(
+        this.contentEl.data,
+        should_fetch || statisticsUpdates.size > 0,
+      );
+      const visible_range = this.isBrowsing
+        ? this.getVisibleRange()
+        : undefined;
+      const uirevision = this.isBrowsing
+        ? this.contentEl.layout?.uirevision || 0
+        : Math.random();
+      const yaml = merge(
+        {},
+        this.config,
+        {
+          layout: {
+            ...this.size,
+            uirevision,
+          },
+          fetch_mask,
+        },
+        visible_range ? { visible_range } : {},
+
+        this.config,
+      );
+      const { errors, parsed } = await this.configParser.update({
+        now,
+        yaml,
+        hass: this.hass,
+        css_vars: this.getCSSVars(),
+        statisticsUpdates:
+          !should_fetch && statisticsUpdates.size > 0
+            ? statisticsUpdates
+            : undefined,
+      });
+      if (this.disconnected) return;
+      // The user moved the plot while the data loaded. That move started a
+      // new render, so don't draw the old range over it.
+      if (visible_range && `${this.getVisibleRange()}` !== `${visible_range}`)
+        return;
+      this.errorMsgEl.style.display = errors.length ? "block" : "none";
+      this.errorMsgEl.innerHTML = errors
+        .map((e) => "<span>" + (e || "See devtools console") + "</span>")
+        .join("\n<br />\n");
+      this.parsed_config = parsed;
+      this.touchController.isEnabled =
+        !parsed.disable_pinch_to_zoom &&
+        parsed.extended_touch_support !== false;
+      this.touchController.touchHoverEnabled = parsed.touch_hover ?? false;
+      this.updateStatisticsSubscriptions();
+
+      const {
+        entities,
+        layout,
+        config,
+        refresh_interval,
+        autorange_after_scroll,
+      } = this.parsed_config;
+      clearTimeout(this.handles.refreshTimeout!);
+      if (refresh_interval !== "auto" && refresh_interval > 0) {
+        this.handles.refreshTimeout = window.setTimeout(
+          () => this.plot({ should_fetch: true, refresh_statistics: true }),
+          refresh_interval * 1000,
+        );
+      }
+      this.titleEl.innerText = this.parsed_config.title || "";
+      if (layout.paper_bgcolor) {
+        this.titleEl.style.background = layout.paper_bgcolor as string;
+      }
+      // Plotly is only downloaded once a card is drawn
+      let Plotly: typeof import("./plotly").default;
+      try {
+        const plotly = await import("./plotly");
+        const locale = await plotly.loadPlotlyModules(
+          entities,
+          layout,
+          config.locale,
+        );
+        if (locale) config.locale = locale;
+        Plotly = plotly.default;
+        this.touchAdapter.setPlotly(Plotly);
+      } catch (e: any) {
+        this.filesFailed = true;
+        this.errorMsgEl.style.display = "block";
+        this.errorMsgEl.innerText = `Some files of the card didn't load (${e?.message}). If reloading doesn't help, reinstall the card (for a manual install, copy all files of the release). `;
+        const reload = this.errorMsgEl.appendChild(
+          document.createElement("button"),
+        );
+        reload.textContent = "Reload";
+        reload.onclick = () => location.reload();
+        return;
+      }
+      copyPlotlyStyles(this.plotlyStyleEl);
+      await this.withoutRelayout(async () => {
+        const autorangeMainAxis =
+          autorange_after_scroll &&
+          !this.parsed_config.editor_y_axis?.log_fit_bounds;
+        const protectedAxes = this.parsed_config.align_zero
+          ? getZeroAlignmentProtectedAxes(layout, autorangeMainAxis)
+          : undefined;
+        const drawnEntities = prepareHistoryLineGaps(
+          entities,
+          this.parsed_config.raw_plotly_config,
+        );
+        await Plotly.react(this.contentEl, drawnEntities, layout, config);
+        if (autorangeMainAxis) {
+          const update = {
+            "yaxis.autorange": true,
+          };
+          // Plotly accepts attribute paths, but its public types only list nested keys.
+          await Plotly.relayout(
+            this.contentEl,
+            update as Partial<Plotly.Layout>,
+          );
+        }
+        const editorUpdate = getEditorYAxisRelayout(
+          this.parsed_config,
+          this.contentEl.layout.yaxis?.range,
+        );
+        if (editorUpdate) await Plotly.relayout(this.contentEl, editorUpdate);
+        if (protectedAxes) {
+          const alignment = getZeroAlignmentRelayout(
+            this.contentEl._fullLayout,
+            this.contentEl._fullData,
+            protectedAxes,
+          );
+          if (alignment) await Plotly.relayout(this.contentEl, alignment);
+        }
+        this.contentEl.style.visibility = "";
+      });
+      if (this.isConnected) this.connectPlotlyListeners();
+    } finally {
+      if (!this.disconnected) finishInitialLoading(this.cardEl, this.loadingEl);
+      this.liveThrottle.renderEnded();
+    }
   });
   // The height of your card. Home Assistant uses this to automatically
   // distribute all cards over the available columns.

@@ -1,5 +1,14 @@
-import Cache, { getEntityKey } from "../cache/Cache";
+import Cache, {
+  getEntityKey,
+  HistoryFetchConfig,
+  HistoryFetchRequest,
+} from "../cache/Cache";
 import { updateObservedRange } from "../cache/observed-range";
+import {
+  getStatisticsUpdatePeriod,
+  isLiveStatisticsRange,
+  StatisticsUpdatePeriod,
+} from "../cache/statistics-refresh";
 import { HATheme } from "./themed-layout";
 
 import propose from "propose";
@@ -14,21 +23,31 @@ import {
   setDateFnDefaultOptions,
 } from "../duration/duration";
 import { parseStatistics } from "./parse-statistics";
+import { canSelectStatisticsTypes } from "./statistics-types";
 import { HomeAssistant } from "custom-card-helpers";
 import filters from "../filters/filters";
 import bounds from "binary-search-bounds";
-import { has } from "lodash";
-import { StatisticValue } from "../recorder-types";
+import has from "lodash/has";
+import set from "lodash/set";
+import {
+  StatisticPeriod,
+  StatisticType,
+  StatisticValue,
+} from "../recorder-types";
 import {
   Config,
   EntityData,
-  EntityIdStatisticsConfig,
+  StatisticsFetchConfig,
   HassEntity,
   InputConfig,
   TimestampRange,
   YValue,
 } from "../types";
 import getDeprecationError from "./deprecations";
+import { resolveTimeZone, toPlotlyTimeZone } from "../timezone";
+import { isPureDefault } from "./pure-default";
+import { getExtremaTrace } from "./extrema";
+import { normalizeEntityId } from "../utils";
 
 class ConfigParser {
   private yaml: Partial<Config> = {};
@@ -36,12 +55,25 @@ class ConfigParser {
   private yaml_with_defaults?: InputConfig;
   private hass?: HomeAssistant;
   cache = new Cache();
+  statisticsPeriods: ReadonlySet<StatisticPeriod> = new Set();
+  private nextStatisticsPeriods = new Set<StatisticPeriod>();
+  private statisticsUpdates?: ReadonlySet<StatisticsUpdatePeriod>;
   private busy = false;
   private fnParam!: FnParam;
   private observed_range: [number, number] = [Date.now(), Date.now()];
+  private historyPrefetched = false;
+  private fetchTime = Date.now();
   private preserveObservedRange = false;
   private retainedCacheRanges: Record<string, TimestampRange[]> = {};
   private failedFetches = new Map<string, unknown>();
+  private evaluatedDefaults = new Map<string, unknown>();
+  private evaluatedFilters = new Set<string>();
+  private statisticsTypes?: StatisticType[];
+  private canSelectStatisticsTypes = false;
+  /** IANA timezone the plot is drawn in, undefined for the browser's */
+  public timeZone?: string;
+  historyEntities: HistoryFetchConfig[] = [];
+  private nextHistoryEntities = new Map<string, HistoryFetchConfig>();
   public resetObservedRange() {
     this.observed_range = [Date.now(), Date.now()];
   }
@@ -50,6 +82,8 @@ class ConfigParser {
     yaml: InputConfig;
     hass: HomeAssistant;
     css_vars: HATheme;
+    statisticsUpdates?: ReadonlySet<StatisticsUpdatePeriod>;
+    now?: number;
   }) {
     if (this.busy) throw new Error("ParseConfig was updated while busy");
     this.busy = true;
@@ -63,23 +97,36 @@ class ConfigParser {
     yaml: input_yaml,
     hass,
     css_vars,
+    statisticsUpdates,
+    now = Date.now(),
   }: {
     yaml: InputConfig;
     hass: HomeAssistant;
     css_vars: HATheme;
+    statisticsUpdates?: ReadonlySet<StatisticsUpdatePeriod>;
+    now?: number;
   }): Promise<{ errors: Error[]; parsed: Config }> {
     this.yaml = {};
     this.errors = [];
     this.failedFetches.clear();
+    this.evaluatedDefaults.clear();
+    this.evaluatedFilters.clear();
     this.hass = hass;
+    this.historyPrefetched = false;
+    // All fetch paths in this update share one cutoff, even after slow requests.
+    this.fetchTime = now;
+    this.nextStatisticsPeriods = new Set();
+    this.nextHistoryEntities = new Map();
+    this.statisticsUpdates = statisticsUpdates;
     // Dynamic ranges advance on refresh; concrete ranges can come from browsing.
-    const inputRange = "visible_range" in input_yaml
-      ? input_yaml.visible_range
-      : undefined;
+    const inputRange =
+      "visible_range" in input_yaml ? input_yaml.visible_range : undefined;
     this.preserveObservedRange =
       Array.isArray(inputRange) && !inputRange.some(is$fn);
     this.retainedCacheRanges = {};
-    this.yaml_with_defaults = addPreParsingDefaults(input_yaml, css_vars);
+    this.yaml_with_defaults = addPreParsingDefaults(input_yaml, css_vars, hass);
+    this.statisticsTypes = undefined;
+    this.canSelectStatisticsTypes = canSelectStatisticsTypes(input_yaml);
     setDateFnDefaultOptions(hass);
 
     this.fnParam = {
@@ -90,7 +137,9 @@ class ConfigParser {
       getFromConfig: () => "",
       get: () => "",
     };
+    await this.evalTimeZone();
     for (const [key, value] of Object.entries(this.yaml_with_defaults)) {
+      if (key === "time_zone") continue; // evaluated by evalTimeZone
       try {
         await this.evalNode({
           parent: this.yaml,
@@ -105,6 +154,10 @@ class ConfigParser {
     }
     this.cache.retain(this.retainedCacheRanges);
     this.yaml = addPostParsingDefaults(this.yaml as Config);
+    this.yaml = toPlotlyTimeZone(this.yaml as Config, this.timeZone);
+    // Publish one complete snapshot; HA updates can arrive while fetching.
+    this.statisticsPeriods = this.nextStatisticsPeriods;
+    this.historyEntities = [...this.nextHistoryEntities.values()];
 
     return { errors: this.errors, parsed: this.yaml as Config };
   }
@@ -132,7 +185,7 @@ class ConfigParser {
       } catch (e) {
         console.warn(
           "Plotly Graph Card: Could not batch statistics requests, falling back to individual requests",
-          e
+          e,
         );
       }
     }
@@ -141,7 +194,7 @@ class ConfigParser {
       !this.fnParam.xs && // hasn't fetched yet
       path.match(/^entities\.\d+\./) &&
       !path.match(
-        /^entities\.\d+\.(entity|attribute|time_offset|statistic|period)/
+        /^entities\.\d+\.(entity|attribute|time_offset|statistic|period)/,
       ) && //isInsideFetchParamNode
       (is$fn(value) || path.match(/^entities\.\d+\.filters\.\d+$/)) // if function of filter
     ) {
@@ -162,14 +215,22 @@ class ConfigParser {
     const error = getDeprecationError(path, value);
     if (error) this.errors?.push(error);
 
-    if (typeof value === "function") {
-      /**
-       * Allowing functions that return functions makes it very slow when large arrays are returned.
-       * This is because awaits are expensive.
-       */
-
-      parent[key] = value = value(this.fnParam);
-    } else if (isObjectOrArray(value)) {
+    const isFunction = typeof value === "function";
+    const isFilterList = isFunction && /^entities\.\d+\.filters$/.test(path);
+    if (isFunction) {
+      parent[key] = value = isPureDefault(value)
+        ? this.evalDefault(value, path)
+        : value(this.fnParam);
+      if (isFilterList && !Array.isArray(value)) {
+        throw new Error("filters must evaluate to an array");
+      }
+    }
+    if (typeof value === "string" && /^entities\.\d+\.entity$/.test(path)) {
+      value = normalizeEntityId(value);
+    }
+    // Generated filters need the regular filter traversal, but other function
+    // results (including large data arrays) must stay opaque.
+    if (isObjectOrArray(value) && (!isFunction || isFilterList)) {
       const me = Array.isArray(value) ? [] : {};
       parent[key] = me;
       for (const [childKey, childValue] of Object.entries(value)) {
@@ -196,12 +257,42 @@ class ConfigParser {
     if (path.match(/^entities\.\d+\.filters\.\d+$/)) {
       await this.evalFilter({ parent, path, key, value });
     }
+    if (path.match(/^entities\.\d+\.filters$/)) this.evaluatedFilters.add(path);
+    if (
+      path.match(/^entities\.\d+\.filters$/) &&
+      this.fnParam.getFromConfig("autorange_after_scroll") &&
+      !this.fnParam.getFromConfig("raw_plotly_config") &&
+      this.fnParam.xs &&
+      this.fnParam.xs.every((x) => x instanceof Date)
+    ) {
+      // Filters may generate dates outside the range already trimmed at fetch time.
+      // Other x formats may represent non-time axes; leave those unchanged.
+      // Clip after the complete chain without mutating arrays stored in vars.
+      const [start, end] = this.getVisibleRange();
+      const mask = this.fnParam.xs.map((x) => +x >= start && +x <= end);
+      this.fnParam.xs = this.fnParam.xs.filter((_, i) => mask[i]);
+      this.fnParam.ys = this.fnParam.ys?.filter((_, i) => mask[i]);
+      this.fnParam.states = this.fnParam.states?.filter((_, i) => mask[i]);
+      this.fnParam.statistics = this.fnParam.statistics?.filter(
+        (_, i) => mask[i],
+      );
+    }
     if (path.match(/^entities\.\d+$/)) {
       if (!this.fnParam.xs) {
         await this.fetchDataForEntity(path);
       }
       const me = parent[key];
       if (!this.fnParam.getFromConfig("raw_plotly_config")) {
+        // Bar fills use marker.color, not the line color assigned by the palette.
+        if (me.type === "bar" && me.marker?.color === undefined) {
+          const layout = this.yaml_with_defaults?.layout;
+          if (
+            layout?.colorway === undefined &&
+            layout?.template?.layout?.colorway === undefined
+          ) {
+            me.marker = { ...me.marker, color: me.line?.color };
+          }
+        }
         if (!me.x) me.x = this.fnParam.xs;
         if (!me.y) me.y = this.fnParam.ys;
         if (me.x.length === 0 && me.y.length === 0) {
@@ -232,14 +323,14 @@ class ConfigParser {
           trace.legendgroup ??= "group" + i;
           entities.push({
             texttemplate: `%{y:.2~f} ${this.fnParam.getFromConfig(
-              `entities.${i}.unit_of_measurement`
+              `entities.${i}.unit_of_measurement`,
             )}`, // here so it can be overwritten
             ...trace,
             cliponaxis: false, // allows the marker + text to be rendered above the right y axis. See https://github.com/dbuezas/lovelace-plotly-graph-card/issues/171
             mode: "text+markers",
             showlegend: false,
             hoverinfo: "skip",
-// hovertemplate overrides hoverinfo in Plotly; must be cleared for "skip" to apply
+            // hovertemplate overrides hoverinfo in Plotly; must be cleared for "skip" to apply
             hovertemplate: null,
             textposition: "middle right",
             marker: {
@@ -252,6 +343,14 @@ class ConfigParser {
             y: trace.y.slice(-1),
           });
         }
+        if (trace.show_extrema) {
+          const extrema = getExtremaTrace(trace, this.getVisibleRange());
+          if (extrema) {
+            trace.legendgroup ??= "group" + i;
+            extrema.legendgroup = trace.legendgroup;
+            entities.push(extrema);
+          }
+        }
       }
     }
   }
@@ -261,11 +360,15 @@ class ConfigParser {
       this.fnParam.getFromConfig("visible_range");
     if (!visible_range) {
       let global_offset = parseTimeDuration(
-        this.fnParam.getFromConfig("time_offset")
+        this.fnParam.getFromConfig("time_offset"),
       );
       const hours_to_show = this.fnParam.getFromConfig("hours_to_show");
       if (isRelativeTime(hours_to_show)) {
-        const [start, end] = parseRelativeTime(hours_to_show);
+        const [start, end] = parseRelativeTime(
+          hours_to_show,
+          this.timeZone,
+          this.fetchTime,
+        );
         visible_range = [start + global_offset, end + global_offset];
       } else {
         let ms_to_show;
@@ -275,18 +378,49 @@ class ConfigParser {
           ms_to_show = hours_to_show * 60 * 60 * 1000;
         } else {
           throw new Error(
-            `${hours_to_show} is not a valid duration. Use numbers, durations (e.g 1d) or dynamic time (e.g current_day)`
+            `${hours_to_show} is not a valid duration. Use numbers, durations (e.g 1d) or dynamic time (e.g current_day)`,
           );
         }
-        const now = Date.now();
-        visible_range = [
-          now - ms_to_show + global_offset,
-          now + global_offset,
-        ];
+        const now = this.fetchTime;
+        visible_range = [now - ms_to_show + global_offset, now + global_offset];
       }
       this.yaml.visible_range = visible_range;
     }
     return visible_range;
+  }
+
+  /**
+   * Resolves the timezone once, before anything else, so the whole plot uses
+   * the same one. An invalid value is reported and falls back to the
+   * browser's timezone instead of breaking the card.
+   */
+  private async evalTimeZone() {
+    this.timeZone = undefined;
+    try {
+      if (this.yaml_with_defaults && "time_zone" in this.yaml_with_defaults) {
+        await this.evalNode({
+          parent: this.yaml,
+          path: "time_zone",
+          key: "time_zone",
+          value: this.yaml_with_defaults.time_zone,
+        });
+      }
+      this.timeZone = resolveTimeZone(this.yaml.time_zone, this.hass);
+    } catch (e) {
+      console.warn("Plotly Graph Card: Error parsing [time_zone]", e);
+      this.errors?.push(e as Error);
+    }
+    this.fnParam.timeZone = this.timeZone;
+  }
+
+  private shouldFetch(index: number, period?: StatisticPeriod) {
+    const fetchMask: boolean[] = this.fnParam.getFromConfig("fetch_mask") || [];
+    if (fetchMask[index] === false) return false;
+    return (
+      !this.statisticsUpdates ||
+      (period !== undefined &&
+        this.statisticsUpdates.has(getStatisticsUpdatePeriod(period)))
+    );
   }
 
   private async prefetchStatistics() {
@@ -300,9 +434,9 @@ class ConfigParser {
       return;
     }
 
-    const fetch_mask: boolean[] = this.fnParam.getFromConfig("fetch_mask") || [];
     const requests: {
-      entity: EntityIdStatisticsConfig;
+      index: number;
+      entity: StatisticsFetchConfig;
       range: TimestampRange;
     }[] = [];
     entities.forEach((entity, i) => {
@@ -312,11 +446,7 @@ class ConfigParser {
         period,
         time_offset: timeOffset,
       } = entity;
-      if (
-        fetch_mask[i] === false ||
-        !entityId ||
-        [entityId, statistic, period, timeOffset].some(is$fn)
-      ) {
+      if (!entityId || [entityId, statistic, period, timeOffset].some(is$fn)) {
         return;
       }
 
@@ -324,13 +454,20 @@ class ConfigParser {
         const statisticsParams = parseStatistics(
           visible_range,
           statistic,
-          period
+          period,
         );
         if (!statisticsParams) return;
         const offset = parseTimeDuration(timeOffset);
         requests.push({
-          entity: { entity: entityId, ...statisticsParams },
-          range: [visible_range[0] - offset, visible_range[1] - offset],
+          index: i,
+          entity: {
+            entity: entityId,
+            ...statisticsParams,
+          },
+          range: [
+            visible_range[0] - offset,
+            Math.min(visible_range[1] - offset, this.fetchTime),
+          ],
         });
       } catch {
         // The regular entity parser reports malformed dynamic configurations.
@@ -338,8 +475,18 @@ class ConfigParser {
       }
     });
 
-    if (requests.length < 2) return;
-    await this.cache.prefetchStatistics(requests, this.hass!);
+    // Use normalized requests so parseStatistics remains the only source of
+    // defaults. Include masked traces to keep cache coverage stable on refresh.
+    this.statisticsTypes =
+      this.canSelectStatisticsTypes && requests.length
+        ? [...new Set(requests.map(({ entity }) => entity.statistic))].sort()
+        : undefined;
+    const fetchRequests = requests.filter(({ index, entity }) =>
+      this.shouldFetch(index, entity.period),
+    );
+    for (const request of requests) request.entity.types = this.statisticsTypes;
+    if (fetchRequests.length < 2) return;
+    await this.cache.prefetchStatistics(fetchRequests, this.hass!);
   }
 
   private async fetchDataForEntity(path: string) {
@@ -348,26 +495,39 @@ class ConfigParser {
       this.observed_range,
       visible_range,
       this.preserveObservedRange &&
-        !this.fnParam.getFromConfig("autorange_after_scroll")
+        !this.fnParam.getFromConfig("autorange_after_scroll"),
     );
     const statisticsParams = parseStatistics(
       visible_range,
       this.fnParam.getFromConfig(path + ".statistic"),
-      this.fnParam.getFromConfig(path + ".period")
+      this.fnParam.getFromConfig(path + ".period"),
     );
     const attribute = this.fnParam.getFromConfig(path + ".attribute");
     const fetchConfig = {
       entity: this.fnParam.getFromConfig(path + ".entity"),
-      ...(statisticsParams ? statisticsParams : attribute ? { attribute } : {}),
+      ...(statisticsParams
+        ? { ...statisticsParams, types: this.statisticsTypes }
+        : attribute
+          ? { attribute }
+          : {}),
     };
     const offset = parseTimeDuration(
-      this.fnParam.getFromConfig(path + ".time_offset")
+      this.fnParam.getFromConfig(path + ".time_offset"),
     );
 
     const range_to_fetch = [
       visible_range[0] - offset,
-      visible_range[1] - offset,
+      Math.min(visible_range[1] - offset, this.fetchTime),
     ];
+    if (
+      statisticsParams &&
+      isLiveStatisticsRange(
+        range_to_fetch,
+        statisticsParams.period,
+        this.fetchTime,
+      )
+    )
+      this.nextStatisticsPeriods.add(statisticsParams.period);
     const range_to_retain = [
       this.observed_range[0] - offset,
       // A live state can arrive while a history request is in flight. Keeping
@@ -377,17 +537,32 @@ class ConfigParser {
         : Number.POSITIVE_INFINITY,
     ] as [number, number];
     const entityKey = getEntityKey(fetchConfig);
+    if (
+      !statisticsParams &&
+      fetchConfig.entity &&
+      range_to_fetch[1] >= this.fetchTime
+    ) {
+      this.nextHistoryEntities.set(entityKey, fetchConfig);
+    }
     (this.retainedCacheRanges[entityKey] ??= []).push(range_to_retain);
-    const fetch_mask: boolean[] = this.fnParam.getFromConfig("fetch_mask") || [];
+    const fetch_mask: boolean[] =
+      this.fnParam.getFromConfig("fetch_mask") || [];
     const i = getEntityIndex(path);
+    if (!statisticsParams) {
+      try {
+        await this.prefetchHistory(visible_range, fetch_mask);
+      } catch (error) {
+        console.warn(
+          "Plotly Graph Card: Could not batch history requests, falling back to individual requests",
+          error,
+        );
+      }
+    }
     let data: EntityData;
-    if (fetch_mask[i] === false) {
+    if (!this.shouldFetch(i, statisticsParams?.period)) {
       data = this.cache.getData(fetchConfig, [range_to_retain]);
     } else {
-      const requestKey = JSON.stringify([
-        entityKey,
-        ...range_to_fetch,
-      ]);
+      const requestKey = JSON.stringify([entityKey, ...range_to_fetch]);
       // Reuse failures within this update, but allow retries on the next update.
       if (this.failedFetches.has(requestKey)) {
         throw this.failedFetches.get(requestKey);
@@ -397,7 +572,8 @@ class ConfigParser {
           range_to_fetch,
           fetchConfig,
           this.hass!,
-          [range_to_retain]
+          [range_to_retain],
+          this.fetchTime,
         );
       } catch (error) {
         this.failedFetches.set(requestKey, error);
@@ -408,7 +584,7 @@ class ConfigParser {
       this.fnParam.getFromConfig(path + ".extend_to_present") ??
       !statisticsParams;
 
-    data.xs = data.xs.map((x) => new Date(+x + offset));
+    if (offset) data.xs = data.xs.map((x) => new Date(+x + offset));
 
     removeOutOfRange(data, this.observed_range);
     if (extend_to_present && data.xs.length > 0) {
@@ -416,17 +592,61 @@ class ConfigParser {
       // this would make it also work if filters change the data.
       // Would also need to be combined with yet another removeOutOfRange call.
       const last_i = data.xs.length - 1;
-      const now = Math.min(this.observed_range[1], Date.now());
-      data.xs.push(new Date(Math.min(this.observed_range[1], now + offset)));
-      data.ys.push(data.ys[last_i]);
-      if (data.states.length) data.states.push(data.states[last_i]);
-      if (data.statistics.length) data.statistics.push(data.statistics[last_i]);
+      // Shift the source cutoff before limiting it to the displayed range.
+      const end = Math.min(this.observed_range[1], this.fetchTime + offset);
+      if (end > +data.xs[last_i]) {
+        data.xs.push(new Date(end));
+        data.ys.push(data.ys[last_i]);
+        if (data.states.length) data.states.push(data.states[last_i]);
+        if (data.statistics.length)
+          data.statistics.push(data.statistics[last_i]);
+      }
     }
     this.fnParam.xs = data.xs;
     this.fnParam.ys = data.ys;
     this.fnParam.statistics = data.statistics;
     this.fnParam.states = data.states;
     this.fnParam.meta = this.hass?.states[fetchConfig.entity]?.attributes || {};
+  }
+
+  private async prefetchHistory(
+    visibleRange: [number, number],
+    fetchMask: boolean[],
+  ) {
+    if (this.historyPrefetched || this.statisticsUpdates) return;
+    this.historyPrefetched = true;
+
+    const requests: HistoryFetchRequest[] = [];
+    for (let i = 0; i < this.yaml_with_defaults!.entities.length; i++) {
+      if (fetchMask[i] === false) continue;
+      const path = `entities.${i}`;
+      try {
+        const entity = this.getEvaledPath(`${path}.entity`, path);
+        const statistic = this.getEvaledPath(`${path}.statistic`, path);
+        const period = this.getEvaledPath(`${path}.period`, path);
+        const attribute = this.getEvaledPath(`${path}.attribute`, path);
+        const timeOffset = this.getEvaledPath(`${path}.time_offset`, path);
+        if (typeof entity !== "string" || !entity || statistic || period) {
+          continue;
+        }
+        const fetchConfig: HistoryFetchConfig =
+          typeof attribute === "string" && attribute
+            ? { entity, attribute }
+            : { entity };
+        const offset = parseTimeDuration(timeOffset);
+        requests.push({
+          entity: fetchConfig,
+          range: [
+            visibleRange[0] - offset,
+            Math.min(visibleRange[1] - offset, this.fetchTime),
+          ],
+        });
+      } catch {
+        // Dynamic fetch parameters are evaluated later via the existing path.
+      }
+    }
+    if (requests.length < 2) return;
+    await this.cache.prefetchHistory(requests, this.hass!, this.fetchTime);
   }
 
   private getEvaledPath(path: string, callingPath: string) {
@@ -439,15 +659,47 @@ class ConfigParser {
     if (has(this.yaml, path)) return get(this.yaml, path);
 
     let value = this.yaml_with_defaults;
-    for (const key of path.split(".")) {
+    const keys = path.split(".");
+    for (const [index, key] of keys.entries()) {
       if (value === undefined) return undefined;
       value = value[key];
       if (is$fn(value)) {
+        const entityPath = path.match(/^entities\.\d+\./)?.[0];
+        const entityFilters =
+          entityPath && get(this.yaml_with_defaults, `${entityPath}filters`);
+        // Entity defaults depend on the currently fetched/filtered metadata.
+        // Do not evaluate a future entity using the current entity's context.
+        if (
+          index === keys.length - 1 &&
+          isPureDefault(value) &&
+          (!entityPath ||
+            (callingPath.startsWith(entityPath) &&
+              this.fnParam.meta !== undefined &&
+              (this.evaluatedFilters.has(`${entityPath}filters`) ||
+                entityFilters === undefined ||
+                (Array.isArray(entityFilters) && entityFilters.length === 0))))
+        ) {
+          return this.evalDefault(value, path);
+        }
         throw new Error(
-          `Since [${path}] is a $fn, it has to be defined before [${callingPath}]`
+          `Since [${path}] is a $fn, it has to be defined before [${callingPath}]`,
         );
       }
     }
+    return value;
+  }
+  private evalDefault(fn: Function, path: string) {
+    if (this.evaluatedDefaults.has(path))
+      return this.evaluatedDefaults.get(path);
+    const getFromConfig = (query: string) => this.getEvaledPath(query, path);
+    const value = fn({
+      ...this.fnParam,
+      path,
+      getFromConfig,
+      get: getFromConfig,
+    });
+    this.evaluatedDefaults.set(path, value);
+    set(this.yaml, path, value);
     return value;
   }
   private async evalFilter(input: {
@@ -470,8 +722,8 @@ class ConfigParser {
       throw new Error(
         `Filter '${filterName}' doesn't exist. Did you mean <b>${propose(
           filterName,
-          Object.keys(filters)
-        )}<b>?\nOthers: ${Object.keys(filters)}`
+          Object.keys(filters),
+        )}<b>?\nOthers: ${Object.keys(filters)}`,
       );
     }
     const filterfn = config === null ? filter() : filter(config);
@@ -519,7 +771,7 @@ function removeOutOfRange(data: EntityData, range: [number, number]) {
   }
 }
 type GetFromConfig = (
-  string
+  string,
 ) => ReturnType<InstanceType<typeof ConfigParser>["getEvaledPath"]>;
 type FnParam = {
   getFromConfig: GetFromConfig;
@@ -533,6 +785,8 @@ type FnParam = {
   statistics?: StatisticValue[];
   states?: HassEntity[];
   meta?: HassEntity["attributes"];
+  /** IANA timezone the plot is drawn in, undefined for the browser's */
+  timeZone?: string;
 };
 export const getEntityIndex = (path: string) =>
   +path.match(/entities\.(\d+)/)![1];

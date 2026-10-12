@@ -154,6 +154,22 @@ test("keeps literal and regular-expression enum alternatives", () => {
   ]);
 });
 
+test("accepts false for axis overlaying like Plotly's runtime", () => {
+  const schema = valueBranch(
+    convertPlotlyNode({
+      overlaying: {
+        valType: "enumerated",
+        values: ["free", "/^y([2-9]|[1-9][0-9]+)?( domain)?$/"],
+      },
+    }),
+  );
+
+  assert.deepEqual(valueBranch(schema.properties.overlaying).anyOf, [
+    { enum: [false, "free"] },
+    { pattern: "^y([2-9]|[1-9][0-9]+)?( domain)?$", type: "string" },
+  ]);
+});
+
 test("converts object arrays and dynamic subplot properties", () => {
   const schema = valueBranch(
     convertPlotlyNode({
@@ -185,13 +201,13 @@ test("converts object arrays and dynamic subplot properties", () => {
   );
 });
 
-test("derives enabled traces from uncommented registrations", () => {
-  const source = `// traces
-    require("plotly.js/lib/bar"),
-    // require("plotly.js/lib/image"),
-    require("plotly.js/lib/scattermap"),
-    // components
-    require("plotly.js/lib/calendars"),
+test("derives enabled traces from registrations and on-demand groups", () => {
+  const source = `
+    Plotly.register([require("plotly.js/lib/bar")]);
+    const calendars = () => import("plotly.js/lib/calendars");
+    const groupOf: Record<string, string> = {
+      scattermap: "map",
+    };
   `;
   const runtime = {
     traces: {
@@ -343,6 +359,7 @@ test("checked-in schema is generated from Plotly runtime metadata", () => {
       annotations: [{ text: "Current value", x: 1, y: 2 }],
       xaxis2: { visible: false },
       yaxis: { range: [0, 50] },
+      yaxis2: { overlaying: false },
     },
     config: {
       displayModeBar: false,
@@ -359,17 +376,27 @@ test("checked-in schema is generated from Plotly runtime metadata", () => {
         statistic: "mean",
         type: "scatter",
         filters: "$ex []",
+        show_extrema: true,
       },
       {
         entity: "sensor.west",
         marker: { color: "#007bff" },
         offset: -7_200_000,
         type: "bar",
+        filters: [{ min_max: 1000 }, "min_max"],
+        show_extrema: false,
       },
     ],
   });
 
   assert.equal(valid, true, JSON.stringify(validate.errors, null, 2));
+  assert.equal(
+    validate({
+      type: "custom:plotly-graph",
+      entities: [{ entity: "sensor.east", show_extrema: 1 }],
+    }),
+    false,
+  );
 });
 
 test("Plotly 4 schema removes legacy options and validates object titles", () => {
@@ -434,12 +461,11 @@ test("generated schema includes trace-owned layout and data fields", () => {
     assert.ok(layout[key], `Missing layout.${key}`);
   }
   assert.ok(layout.geo);
-  assert.equal(layout.map, undefined);
-  assert.equal(
+  assert.ok(layout.map);
+  assert.ok(
     valueBranch(schema.definitions.PlotlyLayout).patternProperties[
       "^map([2-9]|[1-9][0-9]+)$"
     ],
-    undefined,
   );
   assert.ok(
     valueBranch(schema.definitions.PlotlyLayoutYAxis).properties.autoshift,
@@ -518,10 +544,9 @@ test("config suggestions only include registered geographic subplots", () => {
   };
   collectEnums(zoom);
   assert.ok(suggestions.includes("geo"));
-  assert.equal(
+  assert.ok(
     suggestions.some(
       (value) => typeof value === "string" && value.split("+").includes("map"),
     ),
-    false,
   );
 });

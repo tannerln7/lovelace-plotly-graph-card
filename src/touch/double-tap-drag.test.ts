@@ -1,3 +1,6 @@
+/* Vitest assertions inspect mocked methods; they do not invoke them unbound. */
+/* oxlint-disable typescript/unbound-method */
+import { vi, type Mocked } from "vitest";
 import type { ClaimTouch, TouchSession } from "./contracts";
 import type {
   NativeGestureObservation,
@@ -36,9 +39,9 @@ const event = (type: string, touches: Touch[], changedTouches: Touch[] = []) =>
     changedTouches: changedTouches as unknown as TouchList,
     cancelable: true,
     isTrusted: true,
-    preventDefault: jest.fn(),
-    stopPropagation: jest.fn(),
-    stopImmediatePropagation: jest.fn(),
+    preventDefault: vi.fn(),
+    stopPropagation: vi.fn(),
+    stopImmediatePropagation: vi.fn(),
   }) as unknown as TouchEvent;
 
 const handle = (recognizer: DoubleTapDragRecognizer, value: TouchEvent) => {
@@ -52,22 +55,22 @@ const handle = (recognizer: DoubleTapDragRecognizer, value: TouchEvent) => {
 };
 
 const adapter = (takeover = true) => {
-  const value: jest.Mocked<PlotlyTouchAdapterContract> = {
-    resolveSurface: jest.fn((value: Touch) =>
+  const value: Mocked<PlotlyTouchAdapterContract> = {
+    resolveSurface: vi.fn((value: Touch) =>
       value.target === otherTarget ? otherSurface : surface,
     ),
-    acquireNativeObservation: jest.fn(
+    acquireNativeObservation: vi.fn(
       (_surface: PlotlyTouchSurface, _identifier: number) => observation,
     ),
-    takeOverNativeGesture: jest.fn(
+    takeOverNativeGesture: vi.fn(
       (_observation: NativeGestureObservation) => takeover,
     ),
-    zoom: jest.fn(),
-    showHover: jest.fn(),
-    clearHover: jest.fn(),
-    reconcileNativeTouchEnd: jest.fn(),
-    cleanupCancelledGesture: jest.fn(),
-    releaseNativeObservation: jest.fn(),
+    zoom: vi.fn(),
+    showHover: vi.fn(),
+    clearHover: vi.fn(),
+    reconcileNativeTouchEnd: vi.fn(),
+    cleanupCancelledGesture: vi.fn(),
+    releaseNativeObservation: vi.fn(),
   };
   return value;
 };
@@ -85,10 +88,10 @@ describe("DoubleTapDragRecognizer", () => {
 
   beforeEach(() => {
     now = 1_000;
-    jest.spyOn(Date, "now").mockImplementation(() => now);
+    vi.spyOn(Date, "now").mockImplementation(() => now);
   });
 
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
 
   it("records only a clean release and acquires observation on the matching second start", () => {
     const plotly = adapter();
@@ -219,7 +222,7 @@ describe("DoubleTapDragRecognizer", () => {
 });
 
 describe("DragZoomSession", () => {
-  const makeSession = (plotly: jest.Mocked<PlotlyTouchAdapterContract>) =>
+  const makeSession = (plotly: Mocked<PlotlyTouchAdapterContract>) =>
     new DragZoomSession(plotly, observation, {
       identifier: 2,
       surface,

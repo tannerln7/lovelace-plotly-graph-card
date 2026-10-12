@@ -1,3 +1,6 @@
+/* Vitest assertions inspect mocked methods; they do not invoke them unbound. */
+/* oxlint-disable typescript/unbound-method */
+import { vi, type Mocked } from "vitest";
 import type { ClaimTouch, TouchSession } from "./contracts";
 import type {
   NativeGestureObservation,
@@ -29,9 +32,9 @@ const event = (type: string, touches: Touch[]) =>
     touches: touches as unknown as TouchList,
     cancelable: true,
     isTrusted: true,
-    preventDefault: jest.fn(),
-    stopPropagation: jest.fn(),
-    stopImmediatePropagation: jest.fn(),
+    preventDefault: vi.fn(),
+    stopPropagation: vi.fn(),
+    stopImmediatePropagation: vi.fn(),
   }) as unknown as TouchEvent;
 
 const handle = (recognizer: PinchRecognizer, value: TouchEvent) => {
@@ -45,26 +48,26 @@ const handle = (recognizer: PinchRecognizer, value: TouchEvent) => {
 };
 
 const adapter = (takeover = true) => {
-  const value: jest.Mocked<PlotlyTouchAdapterContract> = {
-    resolveSurface: jest.fn((_touch: Touch) => surface),
-    acquireNativeObservation: jest.fn(
+  const value: Mocked<PlotlyTouchAdapterContract> = {
+    resolveSurface: vi.fn((_touch: Touch) => surface),
+    acquireNativeObservation: vi.fn(
       (_surface: PlotlyTouchSurface, _identifier: number) => observation,
     ),
-    takeOverNativeGesture: jest.fn(
+    takeOverNativeGesture: vi.fn(
       (_observation: NativeGestureObservation) => takeover,
     ),
-    zoom: jest.fn(),
-    showHover: jest.fn(),
-    clearHover: jest.fn(),
-    reconcileNativeTouchEnd: jest.fn(),
-    cleanupCancelledGesture: jest.fn(),
-    releaseNativeObservation: jest.fn(),
+    zoom: vi.fn(),
+    showHover: vi.fn(),
+    clearHover: vi.fn(),
+    reconcileNativeTouchEnd: vi.fn(),
+    cleanupCancelledGesture: vi.fn(),
+    releaseNativeObservation: vi.fn(),
   };
   return value;
 };
 
 const recognize = (
-  plotly: jest.Mocked<PlotlyTouchAdapterContract>,
+  plotly: Mocked<PlotlyTouchAdapterContract>,
   firstCurrent = touch(1, 20, 30),
 ) => {
   const recognizer = new PinchRecognizer(plotly);
@@ -235,7 +238,7 @@ describe("PinchRecognizer", () => {
 });
 
 describe("PinchSession", () => {
-  const makeSession = (plotly: jest.Mocked<PlotlyTouchAdapterContract>) =>
+  const makeSession = (plotly: Mocked<PlotlyTouchAdapterContract>) =>
     new PinchSession(
       plotly,
       observation,

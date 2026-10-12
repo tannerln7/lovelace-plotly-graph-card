@@ -1,33 +1,25 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { build } from "esbuild";
+import { bundleInMemory } from "../build.mjs";
 import { chromium } from "playwright";
 
-const bundle = await build({
-  stdin: {
-    contents: `
-      import Plotly from "./src/plotly";
-      export { Plotly };
-      export { PlotlyGraph } from "./src/plotly-graph-card";
-      export { PlotlyTouchAdapter, TouchController } from "./src/touch";
-    `,
-    resolveDir: process.cwd(),
-    sourcefile: "touch-pinch-browser-entry.ts",
-  },
-  bundle: true,
-  write: false,
-  format: "iife",
-  globalName: "TouchPinchTest",
-  outdir: "dist",
-  minify: true,
+const [{ code: script }] = await bundleInMemory({
+  code: `
+    export { default as Plotly } from "./src/plotly";
+    export { PlotlyGraph } from "./src/plotly-graph-card";
+    export { PlotlyTouchAdapter, TouchController } from "./src/touch";
+  `,
+  name: "TouchPinchTest",
 });
-const script = bundle.outputFiles.find((file) =>
-  file.path.endsWith(".js"),
-).text;
-const server = createServer((_request, response) => {
-  response.setHeader("Content-Type", "text/html");
+const server = createServer((request, response) => {
+  if (request.url === "/touch-browser-bundle.js") {
+    response.setHeader("Content-Type", "text/javascript; charset=utf-8");
+    response.end(script);
+    return;
+  }
+  response.setHeader("Content-Type", "text/html; charset=utf-8");
   response.end(`<!doctype html><body><div id="inert">inert</div>
-    <script>${script}</script></body>`);
+    <script src="/touch-browser-bundle.js"></script></body>`);
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 
@@ -90,6 +82,7 @@ try {
         { capture: true },
       );
       const adapter = new TouchPinchTest.PlotlyTouchAdapter(gd);
+      adapter.setPlotly(TouchPinchTest.Plotly);
       const controller = new TouchPinchTest.TouchController({
         root: gd,
         plotly: adapter,
@@ -241,9 +234,7 @@ try {
       clicks: 0,
       doubles: 0,
     });
-    assert.deepEqual(state.wheels, [
-      { deltaY: -30, clientX: cx, clientY: cy },
-    ]);
+    assert.deepEqual(state.wheels, [{ deltaY: -30, clientX: cx, clientY: cy }]);
     assert(span(state.fullX) < 100, "the first pinch move must zoom in");
     assert(closeEnough((state.fullX[0] + state.fullX[1]) / 2, 50, 0.05));
 
@@ -649,8 +640,7 @@ try {
 
     await page.waitForTimeout(350);
     await page.evaluate(async () => {
-      productionTouchFixture.card.plot =
-        productionTouchFixture.productionPlot;
+      productionTouchFixture.card.plot = productionTouchFixture.productionPlot;
       await productionTouchFixture.card.setConfig({
         type: "custom:plotly-graph",
         entities: [],

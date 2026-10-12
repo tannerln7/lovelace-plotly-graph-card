@@ -35,7 +35,7 @@ Created with this [quick and dirty script](./discussion-index.mjs)
 
 Find more advanced examples in [Show & Tell](https://github.com/dbuezas/lovelace-plotly-graph-card/discussions/categories/show-and-tell)
 
-## Yaml syntax validatoin
+## Yaml syntax validation
 
 Web app to assist you with syntax validation and autocomplete: [Plotly graph card yaml editor](https://dbuezas.github.io/lovelace-plotly-graph-card/)
 
@@ -53,13 +53,17 @@ Web app to assist you with syntax validation and autocomplete: [Plotly graph car
 ### Manually
 
 1. Go to [Releases](https://github.com/dbuezas/lovelace-plotly-graph-card/releases)
-2. Download `plotly-graph-card.js` and copy it to your Home Assistant config dir as `<config>/www/plotly-graph-card.js`
+2. Download **all** `.js` files of the release into `<config>/www/plotly-graph-card/`. The card loads the other files only when a chart needs them. From a terminal on Home Assistant:
+   ```sh
+   mkdir -p /config/www/plotly-graph-card && cd /config/www/plotly-graph-card
+   curl -s https://api.github.com/repos/dbuezas/lovelace-plotly-graph-card/releases/latest | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 | xargs -n1 curl -sLO
+   ```
 3. Add a resource to your dashboard configuration. There are two ways:
-   1. **Using UI**: `Settings` → `Dashboards` → `More Options icon` → `Resources` → `Add Resource` → Set Url as `/local/plotly-graph-card.js` → Set Resource type as `JavaScript Module`.
+   1. **Using UI**: `Settings` → `Dashboards` → `More Options icon` → `Resources` → `Add Resource` → Set Url as `/local/plotly-graph-card/plotly-graph-card.js` → Set Resource type as `JavaScript Module`.
       _Note: If you do not see the Resources menu, you will need to enable Advanced Mode in your User Profile_
    2. **Using YAML**: Add following code to lovelace section.
       ```resources:
-        - url: /local/plotly-graph-card.js
+        - url: /local/plotly-graph-card/plotly-graph-card.js
           type: module
       ```
 
@@ -80,7 +84,52 @@ refresh_interval: 10
 
 (\*) I'm reusing the editor of the standard History Card. Cheap, yes, but it works fine. Use yaml for advanced functionality
 
+The visual editor's `min_y_axis` and `max_y_axis` settings control the main
+Y-axis range. Either bound can be omitted to keep that side automatic.
+Bounds are entered in data units, including on logarithmic axes. Non-finite
+bounds and non-positive logarithmic bounds are ignored. If the minimum exceeds
+the maximum, both editor bounds are ignored. If a single bound would reverse the
+automatically calculated range, that bound is ignored as well.
+
+`logarithmic_scale: true` selects a logarithmic main Y-axis.
+When false or omitted, Plotly chooses the axis type automatically unless
+explicitly configured.
+`fit_y_data: true` expands the automatic range to include both the data and the
+editor bounds, rather than using the bounds as fixed limits.
+Explicit Plotly axis types, ranges, autorange settings and `autorangeoptions`
+(including those in an inline template) take precedence over the corresponding
+editor settings.
+`autorange_after_scroll: true` recalculates the main Y-axis after every render,
+overriding fixed editor bounds. Bounds included by `fit_y_data` remain included.
+
 ## Advanced
+
+### Aligning zero on multiple Y-axes
+
+Set `align_zero: true` to place zero at the same height on automatically scaled,
+overlaid linear Y-axes.
+
+Axes whose data does not cross zero are extended to include it: a 20–25 °C
+temperature range becomes 0–25 °C or wider.
+
+```yaml
+type: custom:plotly-graph
+align_zero: true
+entities:
+  - entity: sensor.power
+    yaxis: y
+  - entity: sensor.electricity_price
+    yaxis: y2
+```
+
+Visible series with numeric data participate; hiding a series recalculates the
+alignment without clipping data. Hidden helper axes are ignored.
+
+The option is off by default and may add one Plotly relayout after rendering.
+It only affects overlaid linear axes with unrestricted autorange, leaving user
+zoom, fixed ranges and independent subplots unchanged. With
+`autorange_after_scroll: true`, the main Y-axis is autoranged and can align even
+if its configuration specifies a range.
 
 ### Filling, line width, color
 
@@ -179,9 +228,49 @@ entities:
   - sensor.humidity
 ```
 
+## Trace names
+
+A trace is named after its entity. The name comes from Home Assistant's own
+naming, so it matches what the built-in cards show and follows a renamed device
+or area.
+
+Set `name` to override it:
+
+```yaml
+type: custom:plotly-graph
+entities:
+  - entity: sensor.living_room_thermostat_temperature
+    name: Inside
+```
+
+On Home Assistant 2026.4 and later, `name` can also be a list of parts, so you
+can pick which context to show. In a legend with several traces, dropping the
+device name is often what makes the labels readable:
+
+```yaml
+type: custom:plotly-graph
+entities:
+  - entity: sensor.living_room_thermostat_temperature
+    name:
+      - type: area
+      - type: entity
+```
+
+Each part is one of `entity`, `device`, `area`, `floor`, or `text` with a
+literal value (`{type: text, text: "Inside"}`). Parts that resolve to nothing
+are dropped. Earlier Home Assistant versions cannot resolve a list and fall back
+to the entity's friendly name, so a plain string keeps working everywhere.
+
+Filters that rename their trace still win: `trendline` labels its trace `Trend`,
+and any `fn` filter returning a new `meta.friendly_name` behaves the same way.
+`$ex meta.friendly_name` also keeps returning the entity's `friendly_name`
+attribute, unchanged.
+
 ## Color schemes
 
-Changes default line colors.
+Changes default line and bar colors. Explicit `line.color` and `marker.color`
+settings take precedence. Bar fills use `marker.color`.
+Explicit Plotly `layout.colorway` or template palettes are also preserved.
 See more here: https://github.com/dbuezas/lovelace-plotly-graph-card/blob/master/src/parse-config/parse-color-scheme.ts
 
 ```yaml
@@ -209,9 +298,15 @@ entities:
     attribute: temperature
 ```
 
+### Shared data requests
+
+Cards on the same Home Assistant connection share pending or in-flight history/statistics requests only when their time ranges and options match, while keeping their caches and response data independent.
+
 ### Statistics support
 
 Fetch and plot long-term statistics of an entity
+
+The card requests only the statistic fields used by its traces. Traces with the same sensor, period and time range still share one response, including min/max/mean bands. Entity expressions, filters and presets keep the full statistics response, since custom code can read other fields through `statistics`. Functions used only for time ranges or layout do not disable this optimization.
 
 #### for entities with state_class=measurement (normal sensors, like temperature)
 
@@ -220,8 +315,67 @@ type: custom:plotly-graph
 entities:
   - entity: sensor.temperature
     statistic: max # `min`, `mean` of `max`
-    period: 5minute # `5minute`, `hour`, `day`, `week`, `month`, `auto` # `auto` varies the period depending on the zoom level
+    period: 5minute # `5minute`, `hour`, `day`, `week`, `month`, `year`, `auto` # `auto` varies the period depending on the zoom level
 ```
+
+#### Mean line with a min/max band
+
+Use three traces to show the mean inside the range of recorded measurements.
+The sensor must have `min`, `max` and `mean` statistics, for example a temperature
+measurement sensor. Replace `sensor.temperature` in all three entries below.
+
+```yaml
+type: custom:plotly-graph
+hours_to_show: 7d
+refresh_interval: 300
+defaults:
+  entity:
+    period: hour
+    type: scatter
+    mode: lines
+    legendgroup: temperature
+    line:
+      shape: linear
+      color: rgb(52,152,219)
+layout:
+  legend:
+    groupclick: togglegroup
+entities:
+  - entity: sensor.temperature
+    statistic: min
+    name: Minimum
+    showlegend: false
+    hoverinfo: skip
+    hovertemplate: null
+    line:
+      width: 0.5
+  - entity: sensor.temperature
+    statistic: max
+    name: Maximum
+    showlegend: false
+    hoverinfo: skip
+    hovertemplate: null
+    line:
+      width: 0.5
+    fill: tonexty
+    fillcolor: rgba(52,152,219,0.2)
+  - entity: sensor.temperature
+    statistic: mean
+    name: Temperature
+    show_value: true
+    line:
+      width: 2
+```
+
+Keep the minimum and maximum adjacent: `fill: tonexty` fills the area between
+the maximum and the preceding minimum trace. The mean is drawn last, above the
+band. Their shared `legendgroup` lets the single legend entry toggle all three
+traces and the mean's value label together. Hover labels are shown only for the
+mean.
+
+All three traces reuse the same statistics response when their sensor, period
+and time range match. Common line settings belong in `defaults.entity.line`;
+change the line color and `fillcolor` together to recolor the band.
 
 #### for entities with state_class=total (such as utility meters)
 
@@ -230,7 +384,7 @@ type: custom:plotly-graph
 entities:
   - entity: sensor.temperature
     statistic: state # `state` or `sum`
-    period: 5minute # `5minute`, `hour`, `day`, `week`, `month`, `auto` # `auto` varies the period depending on the zoom level
+    period: 5minute # `5minute`, `hour`, `day`, `week`, `month`, `year`, `auto` # `auto` varies the period depending on the zoom level
 ```
 
 #### automatic period
@@ -258,6 +412,7 @@ entities:
       100d: day
       100w: week
       100M: month # note uppercase M for month. Lowercase are minutes
+      100y: year
 ```
 
 #### step function for auto period
@@ -272,10 +427,29 @@ entities:
       24h: hour # when the visible range is ≥ 1 day, use the `hour` period
       7d: day # from 7 days on, use `day`
       6M: week # from 6 months on, use weeks. Note Uppercase M! (lower case m means minutes)
-      1y: month # from 1 year on, use `month
+      1y: month # from 1 year on, use months
+      10y: year # from 10 years on, use years
 ```
 
 Note that `5minute` period statistics are limited in time as normal recorder history is, contrary to other periods which keep data for years.
+
+## show_extrema:
+
+Labels the minimum and maximum of `scatter`, `scattergl` and vertical `bar`
+series after filters, within the visible time window for time series.
+Non-numeric/unavailable values are ignored; ties use the first occurrence and
+constant series get one label. Labels toggle with the series in the legend.
+
+```yaml
+type: custom:plotly-graph
+entities:
+  - entity: sensor.temperature
+    show_extrema: true
+```
+
+Labels use the series color and unit. Set `texttemplate: '%{y:.1f} °C'` to change
+the format. On a `bar` trace, this also prints text on every bar, since Plotly
+applies the same `texttemplate` to the bars themselves.
 
 ## show_value:
 
@@ -370,7 +544,7 @@ entities:
       width: 1
       dash: dot
       color: deepskyblue
-    x: $ex [Date.now(), Date.now()]
+    x: $ex [new Date(), new Date()]
     y: [0, 1]
 layout:
   yaxis9:
@@ -459,6 +633,7 @@ entities:
     filters:
       - store_var: myVar # stores the datapoints inside `vars.myVar`
       - load_var: myVar # loads the datapoints from `vars.myVar`
+      - align_timestamps: myVar # matches its timestamps to the current trace, available as `vars.aligned.myVar`
 
       # The filters below will only be applied to numeric values. Missing (unavailable) and non-numerics will be left untouched
       - add: 5 # adds 5 to each datapoint
@@ -475,7 +650,7 @@ entities:
       - integrate: h # computes area under the curve in a specific unit of time using Right hand riemann integration. Same units as the derivative
       - integrate:
           unit: h # defaults to h
-          reset_every: 1h # Defaults to 0 (never reset). Any duration unit (ms, s, m, h, d, w, M, y).
+          reset_every: 1h # Defaults to 0 (never reset). Any duration unit; see time_zone below for calendar resets.
           offset: 30m # defaults to 0. Resets happen 30m later
 
       - map_y_numbers: Math.sqrt(y + 10*100) # map the y coordinate of each datapoint. Same available variables as for `map_y`
@@ -513,7 +688,7 @@ entities:
               meta: { unit_of_measurement: "delta" }
             };
           },
-      - resample: 5m # Rebuilds data so that the timestamps in xs are exact multiples of the specified interval, and without gaps. The parameter is the length of the interval and defaults to 5 minutes (see #duration for the format). This is useful when combining data from multiple entities, as the index of each datapoint will correspond to the same instant of time across them.
+      - resample: 5m # Rebuilds data at regular intervals without gaps. Defaults to 5 minutes (see #duration for the format). Useful when combining data from multiple entities, as matching indexes correspond to the same instant across them.
       - resample:
           interval: 5m # defaults to 5m
           interpolate: true # defaults to false (each new point holds the last known value). When true, values are linearly interpolated between the surrounding datapoints. Only numbers are interpolated, so use it after force_numeric (or map_y_numbers)
@@ -521,7 +696,68 @@ entities:
       - force_numeric # converts number-lookinig-strings to actual js numbers and removes the rest. Any filters used after this one will receive numbers, not strings or nulls. Also removes respective elements from xs, states and statistics parameters
 ```
 
+See [time_zone](#time_zone) for the calendar rules used by `integrate.reset_every`.
+
+`resample: 1d` uses midnight in the card's [time_zone](#time_zone), following
+the Home Assistant profile setting by default. Whole-day intervals such as
+`2d` follow the local calendar, anchored at January 1, 1970. A day can therefore
+be 23 or 25 hours long when daylight saving time changes.
+
+Other intervals keep their fixed duration and alignment to the Unix epoch.
+Use `24h` instead of `1d` for the previous fixed 24-hour behavior; fractional
+days such as `1.5d` remain fixed durations too. Intervals must be positive.
+
 #### Examples
+
+##### Adaptive min/max downsampling
+
+Use `min_max` to reduce dense numeric time series while keeping each bucket's minimum
+and maximum at their original timestamps. The number is a point target (at
+least 4), defaulting to 1000:
+
+```yaml
+type: custom:plotly-graph
+hours_to_show: 24
+entities:
+  - entity: sensor.power
+    filters:
+      - min_max: 1000
+```
+
+Zooming reselects points from the original data in the visible time range.
+Small windows below the target keep all measurements. Endpoints and gaps are
+preserved; gap boundaries can increase the output beyond the target. Put this
+filter after any calculations that need every measurement, such as `integrate`.
+
+This reduces plotting work, not Home Assistant history requests or download size.
+Use [statistics](#statistics-support) instead when fetching history is the bottleneck.
+
+##### Trendline on a numeric X-axis
+
+Supply custom `xs` and `ys` inside a filter so `trendline` can use them:
+
+```yaml
+type: custom:plotly-graph
+layout:
+  xaxis:
+    type: linear
+entities:
+  - entity: ""
+    mode: lines
+    filters:
+      - fn: |-
+          () => ({ xs: [2.1, 2.4, 2.9, 3.2, 3.7], ys: [7, 9, 8, 11, 12] })
+      - trendline:
+          type: linear
+          show_formula: true
+          show_r2: true
+```
+
+Explicit trace `x`/`y` arrays override the filtered data, and an explicit `name`
+overrides the formula generated by `show_formula`. Time-series X coordinates
+remain dates.
+
+On numeric axes, `forecast` is still a duration in milliseconds: `2s` adds 2000 X units.
 
 ##### Celcious to farenheit
 
@@ -659,6 +895,39 @@ This can also be used to fetch data by calling a HA service. As this is a call t
 
 ##### Using vars
 
+Use `align_timestamps: name` (or `align_timestamps: [name1, name2]`) to match a
+previously stored series to the current trace's exact timestamps under
+`vars.aligned`, without changing either original series; missing matches become
+`null`. Each call replaces `vars.aligned` with the requested series, so don't
+use `aligned` as a `store_var` name.
+Place it directly before the `map_y` that uses it: intervening filters that drop
+or move points, such as `filter` or `resample`, break alignment with `i` again.
+
+Timestamps must match to the millisecond. Raw history of two different sensors
+almost never shares timestamps, so align series that are on the same grid:
+statistics with the same `period`, or history put through the same `resample`
+interval on both entities. x values that are not dates or numbers never match.
+
+```yaml
+type: custom:plotly-graph
+entities:
+  - entity: sensor.outdoor_temperature
+    statistic: mean
+    period: 5minute
+    internal: true
+    filters:
+      - store_var: outdoor
+  - entity: sensor.indoor_temperature
+    statistic: mean
+    period: 5minute
+    name: Temperature difference
+    filters:
+      - align_timestamps: outdoor
+      - map_y: >-
+          y == null || vars.aligned.outdoor.ys[i] == null
+            ? null : y - vars.aligned.outdoor.ys[i]
+```
+
 Compute absolute humidity
 
 ```yaml
@@ -667,7 +936,7 @@ entities:
   - entity: sensor.wintergarten_clima_humidity
     internal: true
     filters:
-      - resample: 5m # important so the datapoints align in the x axis
+      - resample: 5m # put irregular history on a regular grid
       - map_y: parseFloat(y)
       - store_var: relative_humidity
   - entity: sensor.wintergarten_clima_temperature
@@ -677,7 +946,10 @@ entities:
     filters:
       - resample: 5m
       - map_y: parseFloat(y)
-      - map_y: (6.112 * Math.exp((17.67 * y)/(y+243.5)) * +vars.relative_humidity.ys[i] * 2.1674)/(273.15+y);
+      - align_timestamps: relative_humidity
+      - map_y: >-
+          vars.aligned.relative_humidity.ys[i] == null ? null :
+          (6.112 * Math.exp((17.67 * y)/(y+243.5)) * +vars.aligned.relative_humidity.ys[i] * 2.1674)/(273.15+y);
 ```
 
 Compute dew point
@@ -687,7 +959,7 @@ type: custom:plotly-graph
 entities:
   - entity: sensor.openweathermap_humidity
     internal: true
-    period: 5minute # important so the datapoints align in the x axis. Alternative to the resample filter using statistics
+    period: 5minute
     filters:
       - map_y: parseFloat(y)
       - store_var: relative_humidity
@@ -696,13 +968,15 @@ entities:
     name: Dew point
     filters:
       - map_y: parseFloat(y)
+      - align_timestamps: relative_humidity
       - map_y: >-
           {
             // https://www.omnicalculator.com/physics/dew-point
             const a = 17.625;
             const b = 243.04;
             const T = y;
-            const RH = vars.relative_humidity.ys[i];
+            const RH = vars.aligned.relative_humidity.ys[i];
+            if (RH == null) return null;
             const α = Math.log(RH/100) + a*T/(b+T);
             const Ts = (b * α) / (a - α);
             return Ts; 
@@ -728,7 +1002,8 @@ entities:
     name: sum of temperatures
     filters:
       - map_y: parseFloat(y)
-      - map_y: y + vars.temp1.ys[i]
+      - align_timestamps: temp1
+      - map_y: vars.aligned.temp1.ys[i] == null ? null : y + vars.aligned.temp1.ys[i]
 ```
 
 ### Entity click handlers
@@ -757,11 +1032,18 @@ type: custom:plotly-graph
 entities:
   - entity: sensor.temperature1
     on_click: |-
-      $fn () => (event_data) => {
-        ...
-        // WARNING: this doesn't work and I don't understand why. Help welcome
+      $fn () => ({ points }) => {
+        const point = points[0];
+        console.log(point.x, point.y, point.customdata);
       }
 ```
+
+`on_click` receives Plotly's event data. Use the point's `x`, `y` or
+`customdata` to read the clicked value. `pointIndex` and `pointNumber` refer
+to the rendered trace, not necessarily the original arrays used by filters
+or `$fn` functions. Default history step lines can contain drawing-only
+endpoints before unavailable states. These repeat the last known value and
+its per-point `customdata`; the parsed history remains unchanged.
 
 There is also a double click plot handler, it works on the whole plotting area (not points of an entity). Beware that double click also autoscales the plot.
 
@@ -869,7 +1151,11 @@ Remember you can add a `console.log(the_object_you_want_to_inspect)` and see its
 - Functions are allowed for those properties (`entity`, `attribute`, ...) but they do not receive entity data as parameters. You can still use the `hass` parameter to get the last state of an entity if you need to.
 - Functions cannot return functions for performance reasons. (feature request if you need this)
 - Defaults are not applied to the subelements returned by a function. (feature request if you need this)
-- You can get other values from the yaml with the `getFromConfig` parameter, but if they are functions they need to be defined before.
+- You can get other values from the yaml with the `getFromConfig` parameter,
+  but user-defined functions need to be defined before their callers.
+  Built-in defaults (`name`, `unit_of_measurement`, `hovertemplate`, `yaxis`,
+  `line.color`) can be read from anywhere in the same entity. Values that a
+  filter changes are only up to date below that filter.
 - Any function which uses the result of a filter, needs to be placed in the YAML below the filter. For instance, `name: $ex ys.at(-1)` where the filter is modifying `ys`.
 - The same is true of consecutive filters - order matters. This is due to the fact that filters are translated internally to function calls, executed in the order they are parsed.
 
@@ -939,6 +1225,59 @@ entities:
 hours_to_show: current_day
 ```
 
+#### Linked tooltips in stacked subplots
+
+To show tooltips in all stacked subplots when hovering over one of them, use
+Plotly's native [`hoversubplots: axis`](https://plotly.com/javascript/reference/layout/#layout-hoversubplots)
+with `hovermode: x`. The traces must share the **same X axis** (`x`), which is
+the default, not just matching ranges on separate axes.
+
+This example places temperature and humidity in separate vertical panels. Replace
+the entity IDs with sensors that provide mean statistics. Using the same period
+gives both traces matching timestamps.
+
+```yaml
+type: custom:plotly-graph
+hours_to_show: 24h
+entities:
+  - entity: sensor.garden_temperature
+    name: Temperature
+    statistic: mean
+    period: hour
+  - entity: sensor.garden_humidity
+    name: Humidity
+    statistic: mean
+    period: hour
+    yaxis: y2
+layout:
+  height: 360
+  hovermode: x
+  hoversubplots: axis
+  margin:
+    l: 60
+    r: 20
+    t: 10
+    b: 50
+  xaxis:
+    anchor: y2
+  yaxis:
+    domain: [0.55, 1]
+    anchor: x
+  yaxis2:
+    domain: [0, 0.45]
+    anchor: x
+    overlaying: false
+    side: left
+```
+
+`overlaying: false` overrides the card's default secondary-axis overlay, so the
+second trace occupies its own panel. `side: left` keeps its Y axis on the left,
+and `xaxis.anchor: y2` places the date ticks below the lower panel; neither is
+required for linked hover. This works within one card; it does **not**
+synchronize hover between separate Home Assistant cards or expose `on_hover`
+callbacks. See [#398](https://github.com/dbuezas/lovelace-plotly-graph-card/issues/398)
+for that remaining request.
+
 #### disabling hover text
 
 can be achieved by setting inside entities:
@@ -985,6 +1324,25 @@ entities:
     filters: [] # no filters at all
 ```
 
+Filter lists can also be generated with `$ex` or `$fn`. To reuse filters and
+append entity-specific ones, define the shared list before `entities` and the
+extra list before `filters`:
+
+```yaml
+type: custom:plotly-graph
+reused_filters:
+  - force_numeric
+  - add: 1
+entities:
+  - entity: sensor.temperature
+    extra_filters:
+      - multiply: 2
+    filters: $ex [...get('reused_filters'), ...get('.extra_filters')]
+```
+
+Generated lists run in order, just like literal lists. This additional parsing
+is limited to `entities.*.filters`; other function results are not traversed.
+
 ## layout:
 
 To define layout aspects, like margins, title, axes names, ...
@@ -1010,6 +1368,26 @@ entities:
 ha_theme: false #defaults to true
 ```
 
+You can also use Home Assistant's named theme colors in `$ex` and `$fn` through
+`css_vars`. Values are read from the active CSS theme on each render, without
+the leading `--`:
+
+```yaml
+entities:
+  - entity: sensor.temperature_in_celsius
+    line:
+      color: $ex css_vars['blue-color']
+```
+
+Available colors: `accent-color`, `error-color`, `warning-color`, `success-color`,
+`info-color`, `divider-color`, `disabled-color`, `red-color`, `pink-color`, `purple-color`,
+`deep-purple-color`, `indigo-color`, `blue-color`, `light-blue-color`, `cyan-color`,
+`teal-color`, `green-color`, `light-green-color`, `lime-color`, `yellow-color`,
+`amber-color`, `orange-color`, `deep-orange-color`, `brown-color`, `light-grey-color`,
+`grey-color`, `dark-grey-color`, `blue-grey-color`, `black-color`, and `white-color`.
+The five theme variables listed above remain available too. This does not change
+the default trace palette, and `css_vars` is also available with `ha_theme: false`.
+
 ### Raw plotly config:
 
 Toggle all in-built defaults for layout and entitites. Useful when using histograms, 3d plots, etc.
@@ -1029,13 +1407,32 @@ raw_plotly_config: true # defaults to false
 To define general configurations like enabling scroll to zoom, disabling the modebar, etc.
 Anything from https://plotly.com/javascript/configuration-options/.
 
-## disable_pinch_to_zoom
+## extended_touch_support
+
+Touch gestures on the plot area:
+
+- Drag with one finger: pan (Plotly).
+- Tap: click (Plotly). Double tap: reset (Plotly).
+- `pinch_to_zoom`: pinch with two fingers to zoom at the fingers and pan with them, like a map. Lifting one finger keeps panning with the other.
+- `double_tap_drag_to_zoom`: double tap, keep the finger down and drag up or down to zoom, left or right to pan.
+- `hold_to_scan`: press and hold for 300 ms, then slide. The tooltip follows the finger through the data and stays after lifting the finger, until the next touch. With `hovermode: closest` (Plotly's default) it follows the x position of the finger, like `hovermode: x`. It is off with `hovermode: false`. While it is on, a tap doesn't show the tooltip.
+
+All are on by default. Turn them all off, so only Plotly's own touch handling is left:
 
 ```yaml
-disable_pinch_to_zoom: true # defaults to false
+extended_touch_support: false
 ```
 
-When true, the custom implementations of pinch-to-zoom and double-tap-drag-to-zooming will be disabled.
+Or turn off single ones:
+
+```yaml
+extended_touch_support:
+  pinch_to_zoom: false
+  double_tap_drag_to_zoom: false
+  hold_to_scan: false
+```
+
+See also: [disable_pinch_to_zoom](#disable_pinch_to_zoom) (deprecated)
 
 ## touch_hover
 
@@ -1069,6 +1466,10 @@ It can be combined with the global `time_offset`.
 Removes all data out of the visible range, and autoscales after each replot.
 Particularly useful when combined with [Range Selector Buttons](#Range-Selector-buttons)
 
+Filter output is clipped after the complete filter chain when all X values are
+`Date` objects. Other X formats and raw Plotly configurations are left unchanged.
+No synthetic edge points are added to generated data.
+
 ```yaml
 type: custom:plotly-graph
 entities:
@@ -1079,6 +1480,24 @@ autorange_after_scroll: true
 ## refresh_interval:
 
 Update data every `refresh_interval` seconds.
+
+With `auto`, live state history uses Home Assistant's history stream. Unlike
+frontend state snapshots, the stream includes intermediate changes in a burst
+and catches up with states that Recorder has not committed yet. Entities with
+the same history start time share a stream, so a quiet entity does not make a
+busy entity replay older history. Streams close when the card is removed or
+automatic refresh is disabled.
+
+With `auto`, live statistics also refresh when Home Assistant publishes new
+5-minute or hourly statistics, even if the entity's state has not changed.
+Each event refreshes only its matching resolution: daily, weekly, monthly and yearly
+aggregates refresh with the hourly statistics, not the 5-minute statistics.
+Entity state changes can still update the display without refetching statistics.
+Zooming, panning and toggling traces only fetch missing ranges; they do not
+invalidate cached statistics. Resetting the view also refreshes recent values.
+An explicit refresh interval continues to poll at the configured interval.
+The unconfirmed tail after the last recorded state is checked again, so delayed
+Recorder writes are not permanently hidden behind a cached request boundary.
 
 Examples:
 
@@ -1100,6 +1519,35 @@ config:
 ** Home Assistant custom Number and Date format will be ignored, only the language determines the locale **
 
 When using `hours_to_show: current_week`, the "First day of the week" configured in Home Assistant is used
+
+## time_zone:
+
+Dates are shown in the "Time zone" chosen in the Home Assistant user profile (your browser's or the server's), but it can be overridden like this:
+
+```yaml
+time_zone: server # Home Assistant's timezone
+time_zone: local # the browser's timezone
+time_zone: Europe/Rome # any IANA timezone
+```
+
+This also applies to the boundaries of `hours_to_show: current_day` and friends, and to `integrate`'s `reset_every`.
+
+For `integrate`, whole-day resets such as `reset_every: 1d` and `2d` use the same
+calendar grid as `resample`, including 23- and 25-hour days. Whole-week resets
+(`1w`, `2w`, etc.) use the first weekday configured in Home Assistant. Whole-month
+resets (`1M`, `2M`, etc.) start on the first of a calendar month, and whole-year
+resets (`1y`, `2y`, etc.) on January 1st. Multi-period
+groups use a stable 1970 calendar anchor, so reloading does not move the reset.
+
+`reset_every: 24h`, fractional intervals and other units keep their fixed
+durations. `offset` shifts a reset by the specified elapsed duration after its
+calendar boundary, not by wall-clock hours.
+
+An invalid `time_zone` is reported as an error and the browser's timezone is used instead.
+
+Give times as `Date` objects (e.g. `new Date()`), not as numbers like `Date.now()`: only Dates are converted to the selected time zone, so a number would be drawn in the browser's time zone.
+
+When a timezone other than the browser's is used, the x values Plotly hands back (e.g. `points[0].x` in `on_click`, and hover values) are date strings in that timezone, like `"2024-03-31 02:30:00.000"`, not `Date` objects. Don't pass them to `new Date(...)`, which would read them in the browser's timezone. The `xs` passed to `$fn` and filters are still real `Date`s.
 
 ## Presets
 
@@ -1279,9 +1727,13 @@ Removed in v3.0.0, non significant changes are also fetched now. The bandwidth s
 
 Removed in v3.0.0, if you need access to the attributes use the 'attribute' parameter instead. It doesn't matter which attribute you pick, all of them are still accessible inside filters and universal functions
 
+### `disable_pinch_to_zoom`
+
+Replaced with [extended_touch_support](#extended_touch_support) in v4.0.0. `disable_pinch_to_zoom: true` still works and is the same as `extended_touch_support: false`.
+
 ## Plotly.js 4 compatibility
 
-This card uses Plotly.js 4.1.1. Review custom Plotly configurations when
+This card uses Plotly.js 4.1.2. Review custom Plotly configurations when
 upgrading from 2.x or 3.x:
 
 Plotly.js 3 removed the deprecated `pointcloud` and `heatmapgl` trace types,
@@ -1289,8 +1741,8 @@ as well as the `transforms` API. Configurations using these features must be
 migrated before upgrading.
 
 - Plotly.js 4 removes Mapbox traces and `layout.mapbox`, MathJax 2 support,
-  Chart Studio options and `*src` attributes. Mapbox traces were not registered
-  in this card's bundle; this update does not add map trace support.
+  Chart Studio options and `*src` attributes. Use the MapLibre types
+  `scattermap`, `choroplethmap` and `densitymap` instead.
 - Colors must use valid CSS syntax. `hsv(...)` is no longer supported, and RGB
   channels between 0 and 1 are no longer interpreted as fractions of 255.
   Standard hex colors and `rgba(52, 152, 219, 0.82)` continue to work.
@@ -1305,7 +1757,7 @@ migrated before upgrading.
   to send chart data to Plotly Cloud. The previous 300 ms double-click delay
   is also retained unless configured otherwise.
 
-See the [Plotly.js changelog](https://github.com/plotly/plotly.js/blob/v4.1.1/CHANGELOG.md)
+See the [Plotly.js changelog](https://github.com/plotly/plotly.js/blob/v4.1.2/CHANGELOG.md)
 for the complete list of changes, including changes to SPLOM axis matching
 and event coordinates.
 
@@ -1349,39 +1801,47 @@ properties are not interchangeable with Cartesian axis titles, which use
 
 The card's own top-level `title:` option is unchanged.
 
-The bundled Plotly build also supports `scattergl`, `splom`, `parcoords`,
-`scatterpolargl`, and `scattersmith`. WebGL traces require browser WebGL support.
-The MapLibre types `scattermap`, `choroplethmap`, and `densitymap` are not included
-to keep the bundle size down.
+Every Plotly trace type is supported, including `image`, `quiver` and the
+MapLibre maps `scattermap`, `choroplethmap` and `densitymap`. WebGL traces
+require browser WebGL support. The card only downloads the code of the trace
+types it draws: lines and bars come with Plotly's core, other types are loaded
+the first time a card needs them.
 
 # Development
 
-- Use Node.js 22 or newer (required by Plotly.js 4).
+- Install [Bun](https://bun.sh)
 - Clone the repo
-- run `npm i`
-- run `npm start`
-- From a dashboard in edit mode, go to `Manage resources` and add `http://127.0.0.1:8000/plotly-graph-card.js` as url with resource type JavaScript
+- run `bun install`
+- run `bun run start`
+- From a dashboard in edit mode, go to `Manage resources` and add `http://127.0.0.1:8000/plotly-graph-card.js` as url with resource type JavaScript Module
 - ATTENTION: The development card is `type: custom:plotly-graph-dev` (mind the extra `-dev`)
 - Either use Safari or Enable [chrome://flags/#unsafely-treat-insecure-origin-as-secure](chrome://flags/#unsafely-treat-insecure-origin-as-secure) and add your HA address (e.g http://homeassistant.local:8123): Chrome doesn't allow public network resources from requesting private-network resources - unless the public-network resource is secure (HTTPS) and the private-network resource provides appropriate (yet-undefined) CORS headers. More [here](https://stackoverflow.com/questions/66534759/chrome-cors-error-on-request-to-localhost-dev-server-from-remote-site)
 
 # Build
 
-`npm run build`
+`bun run build`
 
 ## Upgrade checks
 
-Run `npm run tsc` and `npm test -- src/parse-config/defaults.test.ts` for
+Run `bun run tsc` and `bun run test src/parse-config/defaults.test.ts` for
 the compatibility checks. For rendering checks, install Chromium with
-`npx playwright install chromium` and run `npm run test:browser`.
+`bunx playwright install chromium` (or set `CHROME=/path/to/chrome`)
+and run `bun run test:browser`.
 The browser test covers every registered trace type, tank shapes and labels,
 axis defaults, cloud-upload opt-in, and a card with a mock Home Assistant state.
+Run `bun run test:loading` to check the initial loading height, delayed data,
+rendering failures, recovery and reduced-motion support in Chromium.
+`bun run test` includes history batching, compressed WebSocket responses, cache reuse,
+attributes, time offsets and request failure recovery.
 The five additional trace types are also validated and rendered through the card.
-Run `npm run test:card-lifecycle` to check initial rendering, recovery from
+Run `bun run test:card-lifecycle` to check initial rendering, recovery from
 render failures, event suppression, listener cleanup on reconnect, and mouse
 interactions with data points, legend toggles and the reset button.
-Run `npm run test:statistics` for statistics batching, cache reuse, period and
+Run `bun run test:statistics` for statistics batching, cache reuse, period and
 time-offset separation, dynamic settings and fallback after failed requests.
-Run `npm run test:cache` for rolling-window retention, boundary values,
+Run `bun run test:resize` for unchanged-size callbacks, hidden cards and normal
+width changes. These tests do not run Home Assistant's view components.
+Run `bun run test:cache` for rolling-window retention, boundary values,
 time offsets, browsing, refetching pruned history and in-flight live updates.
 
 # Release

@@ -1,24 +1,17 @@
 import assert from "node:assert/strict";
-import { build } from "esbuild";
+import { bundleInMemory } from "../build.mjs";
 import { chromium } from "playwright";
 
 // Share the actual Plotly instance with the card so failures can be injected
 // without replacing its event system or the card's render path.
-const bundle = await build({
-  stdin: {
-    contents: `export { default as Plotly } from './src/plotly';
+const [bundle] = await bundleInMemory({
+  code: `export { default as Plotly } from './src/plotly';
       export { PlotlyGraph } from './src/plotly-graph-card';`,
-    resolveDir: process.cwd(),
-    loader: "ts",
-  },
-  bundle: true,
-  write: false,
-  format: "iife",
-  globalName: "LifecycleTest",
-  outdir: "dist",
-  minify: true,
+  name: "LifecycleTest",
 });
-const browser = await chromium.launch();
+const browser = await chromium.launch({
+  executablePath: process.env.CHROME || undefined,
+});
 try {
   const page = await browser.newPage();
   page.setDefaultTimeout(5000);
@@ -27,7 +20,7 @@ try {
   page.on("pageerror", (error) => errors.push(error.message));
   await page.setContent("<!doctype html><body></body>");
   await page.addScriptTag({
-    content: bundle.outputFiles.find((file) => file.path.endsWith(".js")).text,
+    content: bundle.code,
   });
   const results = await page.evaluate(async () => {
     const { Plotly, PlotlyGraph } = LifecycleTest;
@@ -62,6 +55,7 @@ try {
     );
     const card = new PlotlyGraph();
     const noop = () => {};
+    /** @type {[string, string, object | undefined][]} */
     const handlerEvents = [
       ["plotly_relayout", "onRelayout", {}],
       ["plotly_restyle", "onRestyle", {}],
@@ -236,13 +230,15 @@ try {
     checkListeners(1);
     results.push("later render failure preserves working listeners");
 
+    const queuedRender = card._plot(50);
     card.remove();
+    await queuedRender;
     checkListeners(0);
     document.body.append(card);
     await card._plot();
     checkListeners(1);
     checkInteractions();
-    results.push("disconnect and reconnect do not duplicate listeners");
+    results.push("removed cards skip queued renders and reconnect normally");
 
     Plotly.react = async (...args) => {
       const result = await realReact(...args);
@@ -264,6 +260,38 @@ try {
     card.remove();
     Plotly.purge(card.contentEl);
     Plotly.newPlot = realNewPlot;
+    const waitingCard = new PlotlyGraph();
+    waitingCard.plot = async () => {};
+    document.body.append(waitingCard);
+    const waitingRender = waitingCard._plot();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise(requestAnimationFrame);
+    waitingCard.remove();
+    await waitingRender;
+    check(
+      !waitingCard.parsed_config,
+      "Removed card kept waiting for its initial configuration",
+    );
+    check(
+      waitingCard.cardEl.getAttribute("aria-busy") === "true",
+      "Removing a card prematurely finished its loading state",
+    );
+    waitingCard.hass = { states: {}, locale: { language: "en" } };
+    await waitingCard.setConfig({
+      type: "custom:plotly-graph",
+      refresh_interval: 0,
+      entities: [],
+    });
+    document.body.append(waitingCard);
+    await waitingCard._plot();
+    check(
+      waitingCard.parsed_config &&
+        waitingCard.cardEl.getAttribute("aria-busy") === "false",
+      "Reconnected card could not finish loading",
+    );
+    waitingCard.remove();
+    Plotly.purge(waitingCard.contentEl);
+    results.push("removing a card ends its initial wait and permits recovery");
     return results;
   });
   await page.evaluate(async () => {

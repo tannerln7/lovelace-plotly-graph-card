@@ -1,3 +1,6 @@
+/* Vitest assertions inspect mocked methods; they do not invoke them unbound. */
+/* oxlint-disable typescript/unbound-method */
+import { vi, type Mocked } from "vitest";
 import type { ClaimTouch, TouchSession } from "./contracts";
 import { TouchController } from "./controller";
 import type {
@@ -25,33 +28,33 @@ const event = (type: string, touches: Touch[]) =>
     changedTouches: [] as unknown as TouchList,
     cancelable: true,
     isTrusted: true,
-    preventDefault: jest.fn(),
-    stopPropagation: jest.fn(),
-    stopImmediatePropagation: jest.fn(),
+    preventDefault: vi.fn(),
+    stopPropagation: vi.fn(),
+    stopImmediatePropagation: vi.fn(),
   }) as unknown as TouchEvent;
 
 const adapter = () => {
-  const value: jest.Mocked<PlotlyTouchAdapterContract> = {
-    resolveSurface: jest.fn((_touch: Touch) => surface),
-    acquireNativeObservation: jest.fn(
+  const value: Mocked<PlotlyTouchAdapterContract> = {
+    resolveSurface: vi.fn((_touch: Touch) => surface),
+    acquireNativeObservation: vi.fn(
       (_surface: PlotlyTouchSurface, _identifier: number) => observation,
     ),
-    takeOverNativeGesture: jest.fn(
+    takeOverNativeGesture: vi.fn(
       (_observation: NativeGestureObservation) => true,
     ),
-    zoom: jest.fn(),
-    showHover: jest.fn(),
-    clearHover: jest.fn(),
-    reconcileNativeTouchEnd: jest.fn(),
-    cleanupCancelledGesture: jest.fn(),
-    releaseNativeObservation: jest.fn(),
+    zoom: vi.fn(),
+    showHover: vi.fn(),
+    clearHover: vi.fn(),
+    reconcileNativeTouchEnd: vi.fn(),
+    cleanupCancelledGesture: vi.fn(),
+    releaseNativeObservation: vi.fn(),
   };
   return value;
 };
 
 describe("LongPressRecognizer", () => {
-  beforeEach(() => jest.useFakeTimers());
-  afterEach(() => jest.useRealTimers());
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
 
   it("claims after elapsed time and shows hover at the latest tolerated point", () => {
     const plotly = adapter();
@@ -66,7 +69,7 @@ describe("LongPressRecognizer", () => {
     recognizer.handle(event("touchmove", [touch(7, 16, 21)]), claim);
     expect(plotly.showHover).not.toHaveBeenCalled();
 
-    jest.advanceTimersByTime(LONG_PRESS_MS);
+    vi.advanceTimersByTime(LONG_PRESS_MS);
 
     expect(session).toBeInstanceOf(HoverSession);
     expect(plotly.takeOverNativeGesture).toHaveBeenCalledWith(observation);
@@ -90,11 +93,11 @@ describe("LongPressRecognizer", () => {
   ])("invalidates its timer and lease after %s", (_reason, invalidating) => {
     const plotly = adapter();
     const recognizer = new LongPressRecognizer(plotly);
-    const claim = jest.fn(() => true);
+    const claim = vi.fn(() => true);
     recognizer.handle(event("touchstart", [touch(7, 10, 20)]), claim);
     recognizer.handle(invalidating, claim);
 
-    jest.advanceTimersByTime(LONG_PRESS_MS);
+    vi.advanceTimersByTime(LONG_PRESS_MS);
 
     expect(claim).not.toHaveBeenCalled();
     expect(plotly.takeOverNativeGesture).not.toHaveBeenCalled();
@@ -104,15 +107,15 @@ describe("LongPressRecognizer", () => {
   it("cannot claim after controller reset and releases a rejected claim", () => {
     const plotly = adapter();
     const recognizer = new LongPressRecognizer(plotly);
-    const staleClaim = jest.fn(() => true);
+    const staleClaim = vi.fn(() => true);
     recognizer.handle(event("touchstart", [touch(7, 10, 20)]), staleClaim);
     recognizer.reset();
-    jest.advanceTimersByTime(LONG_PRESS_MS);
+    vi.advanceTimersByTime(LONG_PRESS_MS);
     expect(staleClaim).not.toHaveBeenCalled();
 
-    const rejectedClaim = jest.fn(() => false);
+    const rejectedClaim = vi.fn(() => false);
     recognizer.handle(event("touchstart", [touch(8, 20, 30)]), rejectedClaim);
-    jest.advanceTimersByTime(LONG_PRESS_MS);
+    vi.advanceTimersByTime(LONG_PRESS_MS);
     expect(rejectedClaim).toHaveBeenCalledTimes(1);
     expect(plotly.showHover).not.toHaveBeenCalled();
     expect(plotly.releaseNativeObservation).toHaveBeenCalledTimes(2);
@@ -120,7 +123,7 @@ describe("LongPressRecognizer", () => {
 });
 
 describe("HoverSession", () => {
-  const makeSession = (plotly: jest.Mocked<PlotlyTouchAdapterContract>) =>
+  const makeSession = (plotly: Mocked<PlotlyTouchAdapterContract>) =>
     new HoverSession(plotly, observation, {
       identifier: 7,
       surface,
@@ -167,31 +170,31 @@ describe("HoverSession", () => {
 });
 
 describe("TouchController hover cancellation", () => {
-  beforeEach(() => jest.useFakeTimers());
-  afterEach(() => jest.useRealTimers());
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
 
   it("clears active hover and releases its observation once when a feature gate changes", () => {
     const plotly = adapter();
     const listeners = new Map<string, EventListener>();
     const root = {
-      addEventListener: jest.fn(
+      addEventListener: vi.fn(
         (type: string, listener: EventListenerOrEventListenerObject) =>
           listeners.set(type, listener as EventListener),
       ),
-      removeEventListener: jest.fn(),
+      removeEventListener: vi.fn(),
     } as unknown as HTMLElement;
     const controller = new TouchController({
       root,
       plotly,
-      onGestureStart: jest.fn(),
-      onGestureEnd: jest.fn(),
+      onGestureStart: vi.fn(),
+      onGestureEnd: vi.fn(),
     });
     controller.isEnabled = false;
     controller.touchHoverEnabled = true;
     controller.connect();
 
     listeners.get("touchstart")?.(event("touchstart", [touch(7, 10, 20)]));
-    jest.advanceTimersByTime(LONG_PRESS_MS);
+    vi.advanceTimersByTime(LONG_PRESS_MS);
     expect(plotly.showHover).toHaveBeenCalledTimes(1);
     plotly.clearHover.mockClear();
 

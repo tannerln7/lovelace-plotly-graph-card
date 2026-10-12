@@ -2,7 +2,7 @@ import { ConfigParser } from "./parse-config";
 import { getEntityKey } from "../cache/Cache";
 import type { EntityConfig } from "../types";
 
-jest.mock("../filters/filters", () => ({ __esModule: true, default: {} }));
+vi.mock("../filters/filters", () => ({ default: {} }));
 
 const HOUR = 3600000;
 const BASE = Date.parse("2025-01-01T00:00:00Z");
@@ -21,27 +21,30 @@ function state(timestamp: number, value = String((timestamp - BASE) / HOUR)) {
 }
 function setup() {
   const samples = Array.from({ length: 200 }, (_, i) => state(BASE + i * HOUR));
-  const callApi = jest.fn(async (_method, uri) => {
-    const [path, query] = uri.split("?");
-    const start = Date.parse(path.replace("history/period/", ""));
-    const end = Date.parse(new URLSearchParams(query).get("end_time")!);
+  const callWS = vi.fn(async (request) => {
+    expect(request.type).toBe("history/history_during_period");
+    const start = Date.parse(request.start_time);
+    const end = Date.parse(request.end_time);
     const previous = samples
       .filter((sample) => Date.parse(sample.last_updated) < start)
       .at(-1);
     const boundary = previous ? [state(start, previous.state)] : [];
-    return [
-      [
-        ...boundary,
-        ...samples.filter(
-          (sample) =>
-            Date.parse(sample.last_updated) >= start &&
-            Date.parse(sample.last_updated) <= end,
-        ),
-      ],
-    ];
+    return Object.fromEntries(
+      request.entity_ids.map((entity_id: string) => [
+        entity_id,
+        [
+          ...boundary,
+          ...samples.filter(
+            (sample) =>
+              Date.parse(sample.last_updated) >= start &&
+              Date.parse(sample.last_updated) <= end,
+          ),
+        ].map((sample) => ({ ...sample, entity_id })),
+      ]),
+    );
   });
   const hass = {
-    callApi,
+    callWS,
     states: { [sensor.entity]: state(Date.now()) },
     locale: { language: "en", first_weekday: "monday" },
   };
@@ -61,7 +64,7 @@ function setup() {
       hass: hass as any,
       css_vars: {} as any,
     });
-  return { parser, callApi, update };
+  return { parser, callWS, update };
 }
 
 describe("ConfigParser cache retention", () => {
@@ -69,20 +72,23 @@ describe("ConfigParser cache retention", () => {
     (global as any).window = {};
   });
   beforeEach(() => {
-    jest.useFakeTimers({ now: BASE + 24 * HOUR });
+    vi.useFakeTimers({
+      now: BASE + 24 * HOUR,
+      toNotFake: ["setTimeout", "clearTimeout"],
+    });
   });
   afterEach(() => {
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   it("rejects concurrent updates until the pending history request completes", async () => {
-    const { callApi, update } = setup();
-    let complete!: (value: ReturnType<typeof state>[][]) => void;
+    const { callWS, update } = setup();
+    let complete!: (value: Record<string, ReturnType<typeof state>[]>) => void;
     let markStarted!: () => void;
     const started = new Promise<void>((resolve) => {
       markStarted = resolve;
     });
-    callApi.mockImplementationOnce(() => {
+    callWS.mockImplementationOnce(() => {
       markStarted();
       return new Promise((resolve) => {
         complete = resolve;
@@ -94,9 +100,9 @@ describe("ConfigParser cache retention", () => {
     await expect(update()).rejects.toThrow(
       "ParseConfig was updated while busy",
     );
-    expect(callApi).toHaveBeenCalledTimes(1);
+    expect(callWS).toHaveBeenCalledTimes(1);
 
-    complete([[state(Date.now(), "24")]]);
+    complete({ [sensor.entity]: [state(Date.now(), "24")] });
     expect((await pending).errors).toEqual([]);
     expect((await update()).errors).toEqual([]);
   });
@@ -124,7 +130,7 @@ describe("ConfigParser cache retention", () => {
   ])("bounds rolling updates using %s", async (_name, config) => {
     const { parser, update } = setup();
     for (let hour = 24; hour < 84; hour++) {
-      jest.setSystemTime(BASE + hour * HOUR);
+      vi.setSystemTime(BASE + hour * HOUR);
       const result = await update(config as object);
       expect(result.errors).toEqual([]);
       expect(ys(result.parsed.entities[0])).toEqual(
@@ -138,18 +144,58 @@ describe("ConfigParser cache retention", () => {
   });
 
   it("preserves previously visited ranges while manually browsing", async () => {
-    const { parser, callApi, update } = setup();
+    const { parser, callWS, update } = setup();
     await update({ visible_range: [BASE + 20 * HOUR, BASE + 24 * HOUR] });
     await update({ visible_range: [BASE + 16 * HOUR, BASE + 20 * HOUR] });
-    const before = callApi.mock.calls.length;
+    const before = callWS.mock.calls.length;
     const result = await update({
       visible_range: [BASE + 20 * HOUR, BASE + 24 * HOUR],
     });
     expect(result.errors).toEqual([]);
-    expect(callApi).toHaveBeenCalledTimes(before);
+    expect(callWS).toHaveBeenCalledTimes(before);
     expect(parser.cache.ranges[key]).toEqual([
       [BASE + 16 * HOUR, BASE + 24 * HOUR],
     ]);
+  });
+
+  it("keeps history batched while pruning and refetching rolling windows", async () => {
+    const { parser, callWS, update } = setup();
+    const entities = [sensor, { entity: "sensor.two" }];
+    for (let hour = 24; hour < 30; hour++) {
+      vi.setSystemTime(BASE + hour * HOUR);
+      const result = await update({}, entities);
+      expect(result.errors).toEqual([]);
+      expect(callWS).toHaveBeenCalledTimes(hour - 23);
+      expect(callWS.mock.calls.at(-1)![0].entity_ids).toEqual([
+        "sensor.one",
+        "sensor.two",
+      ]);
+      for (const [index, entity] of entities.entries()) {
+        expect(ys(result.parsed.entities[index])).toEqual(
+          [hour - 3, hour - 2, hour - 1, hour].map(String),
+        );
+        expect(parser.cache.histories[getEntityKey(entity)]).toHaveLength(4);
+        expect(parser.cache.ranges[getEntityKey(entity)]).toEqual([
+          [Date.now() - 3 * HOUR, Date.now()],
+        ]);
+      }
+    }
+
+    const result = await update(
+      {
+        visible_range: [BASE + 21 * HOUR, BASE + 24 * HOUR],
+      },
+      entities,
+    );
+    expect(result.errors).toEqual([]);
+    expect(callWS).toHaveBeenCalledTimes(7);
+    expect(callWS.mock.calls.at(-1)![0].entity_ids).toEqual([
+      "sensor.one",
+      "sensor.two",
+    ]);
+    for (const trace of result.parsed.entities) {
+      expect(ys(trace)?.slice(0, 4)).toEqual(["21", "22", "23", "24"]);
+    }
   });
 
   it("prunes browsing history when autorange_after_scroll is enabled", async () => {
@@ -166,16 +212,16 @@ describe("ConfigParser cache retention", () => {
   });
 
   it("refetches pruned history when scrolling back", async () => {
-    const { callApi, update } = setup();
+    const { callWS, update } = setup();
     await update();
-    jest.setSystemTime(BASE + 30 * HOUR);
+    vi.setSystemTime(BASE + 30 * HOUR);
     await update();
-    const before = callApi.mock.calls.length;
+    const before = callWS.mock.calls.length;
     const result = await update({
       visible_range: [BASE + 21 * HOUR, BASE + 24 * HOUR],
     });
     expect(result.errors).toEqual([]);
-    expect(callApi.mock.calls.length).toBeGreaterThan(before);
+    expect(callWS.mock.calls.length).toBeGreaterThan(before);
     expect(ys(result.parsed.entities[0])?.slice(0, 4)).toEqual([
       "21",
       "22",
@@ -208,15 +254,15 @@ describe("ConfigParser cache retention", () => {
   });
 
   it("preserves a live state arriving during a rolling history request", async () => {
-    const { parser, callApi, update } = setup();
+    const { parser, callWS, update } = setup();
     const liveTime = Date.now() + 1000;
-    callApi.mockImplementationOnce(async () => {
+    callWS.mockImplementationOnce(async () => {
       parser.cache.add(
         sensor,
         [{ x: new Date(liveTime), y: null, state: state(liveTime, "99") }],
         [liveTime, liveTime],
       );
-      return [[state(Date.now() - HOUR, "23")]];
+      return { [sensor.entity]: [state(Date.now() - HOUR, "23")] };
     });
     const result = await update();
     expect(result.errors).toEqual([]);

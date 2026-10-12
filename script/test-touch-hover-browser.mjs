@@ -1,32 +1,26 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { build } from "esbuild";
+import { bundleInMemory } from "../build.mjs";
 import { chromium } from "playwright";
 
-const bundle = await build({
-  stdin: {
-    contents: `
-      import Plotly from "./src/plotly";
-      export { Plotly };
-      export { PlotlyGraph } from "./src/plotly-graph-card";
-      export { PlotlyTouchAdapter, TouchController } from "./src/touch";
-    `,
-    resolveDir: process.cwd(),
-    sourcefile: "touch-hover-browser-entry.ts",
-  },
-  bundle: true,
-  write: false,
-  format: "iife",
-  globalName: "TouchHoverTest",
-  outdir: "dist",
-  minify: true,
+const [{ code: script }] = await bundleInMemory({
+  code: `
+    export { default as Plotly } from "./src/plotly";
+    export { PlotlyGraph } from "./src/plotly-graph-card";
+    export { PlotlyTouchAdapter, TouchController } from "./src/touch";
+  `,
+  name: "TouchHoverTest",
 });
-const script = bundle.outputFiles.find((file) =>
-  file.path.endsWith(".js"),
-).text;
-const server = createServer((_request, response) => {
-  response.setHeader("Content-Type", "text/html");
-  response.end(`<!doctype html><body><script>${script}</script></body>`);
+const server = createServer((request, response) => {
+  if (request.url === "/touch-browser-bundle.js") {
+    response.setHeader("Content-Type", "text/javascript; charset=utf-8");
+    response.end(script);
+    return;
+  }
+  response.setHeader("Content-Type", "text/html; charset=utf-8");
+  response.end(
+    `<!doctype html><body><script src="/touch-browser-bundle.js"></script></body>`,
+  );
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 
@@ -83,6 +77,7 @@ try {
         gd.on("plotly_click", () => (events.clicks += 1));
         gd.on("plotly_doubleclick", () => (events.doubles += 1));
         const adapter = new TouchHoverTest.PlotlyTouchAdapter(gd);
+        adapter.setPlotly(TouchHoverTest.Plotly);
         const controller = new TouchHoverTest.TouchController({
           root: gd,
           plotly: adapter,

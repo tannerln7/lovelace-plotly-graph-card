@@ -1,8 +1,9 @@
-jest.mock("../../plotly", () => ({
+import { vi, type Mock } from "vitest";
+vi.mock("../../plotly", () => ({
   __esModule: true,
   default: {
-    relayout: jest.fn(),
-    Fx: { hover: jest.fn(), unhover: jest.fn() },
+    relayout: vi.fn(),
+    Fx: { hover: vi.fn(), unhover: vi.fn() },
   },
 }));
 
@@ -87,7 +88,7 @@ class FakePlotRoot extends FakeElement {
   private readonly listeners = new Set<RelayoutListener>();
 
   contains(element: FakeElement): boolean {
-    for (let current: FakeElement | undefined = element; current; ) {
+    for (let current: FakeElement | undefined = element; current;) {
       if (current === this) return true;
       current = current.parent;
     }
@@ -103,7 +104,7 @@ class FakePlotRoot extends FakeElement {
   }
 
   emitRelayouting(update: Plotly.PlotRelayoutEvent): void {
-    for (const listener of [...this.listeners]) listener(update);
+    for (const listener of Array.from(this.listeners)) listener(update);
   }
 
   get listenerCount(): number {
@@ -118,6 +119,7 @@ const makeFixture = () => {
   const adapter = new PlotlyTouchAdapter(
     root as unknown as Plotly.PlotlyHTMLElement,
   );
+  adapter.setPlotly(Plotly);
   const touch = (target: FakeElement, identifier = 1) =>
     ({ target, identifier }) as unknown as Touch;
   return { adapter, child, dragger, root, touch };
@@ -137,7 +139,7 @@ const getRecord = (
 };
 
 describe("PlotlyTouchAdapter native observation", () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => vi.clearAllMocks());
 
   it("resolves and canonicalizes only touched Cartesian surfaces in its root", () => {
     const { adapter, child, dragger, root, touch } = makeFixture();
@@ -165,7 +167,7 @@ describe("PlotlyTouchAdapter native observation", () => {
     const surface = adapter.resolveSurface(touch(child)) as PlotlyTouchSurface;
     const fx = (
       Plotly as unknown as {
-        Fx: { hover: jest.Mock; unhover: jest.Mock };
+        Fx: { hover: Mock; unhover: Mock };
       }
     ).Fx;
 
@@ -198,7 +200,7 @@ describe("PlotlyTouchAdapter native observation", () => {
     const surface = adapter.resolveSurface(touch(child)) as PlotlyTouchSurface;
     const fx = (
       Plotly as unknown as {
-        Fx: { hover: jest.Mock; unhover: jest.Mock };
+        Fx: { hover: Mock; unhover: Mock };
       }
     ).Fx;
     const callbacks: FrameRequestCallback[] = [];

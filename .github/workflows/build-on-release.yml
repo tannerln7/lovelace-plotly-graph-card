@@ -12,21 +12,57 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
+      - uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Update package.json
-        run: npm version ${{ github.ref_name }} --git-tag-version false
+        run: bun pm pkg set version=${GITHUB_REF_NAME#v}
 
       - name: Build
-        run: npm run build
+        run: bun run build
 
-      - name: Upload release asset
+      # The card loads the other files on demand. Upload them first, so a
+      # release is never visible with the card but without its files.
+      - name: Hide the card file during the first upload
+        run: mkdir main && mv dist/plotly-graph-card.js main/
+
+      - name: Upload the on-demand files
         uses: svenstaro/upload-release-action@v2
         with:
-          file: dist/plotly-graph-card.js
+          file: dist/*.js
+          file_glob: true
+
+      - name: Upload the card file
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: main/plotly-graph-card.js
+
+  # Publish the YAML editor, so its schema matches the latest stable release.
+  yaml-editor:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: yaml-editor
+      - run: bun run build
+        working-directory: yaml-editor
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: yaml-editor/dist
+
+      - id: deploy
+        uses: actions/deploy-pages@v5
